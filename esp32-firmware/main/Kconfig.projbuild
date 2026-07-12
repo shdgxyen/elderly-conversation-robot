@@ -1,0 +1,155 @@
+menu "Elder companion firmware"
+
+    choice ELDER_COMMS_TRANSPORT
+        prompt "JSON Lines transport"
+        default ELDER_COMMS_USB_SERIAL_JTAG
+        help
+            Select the point-to-point control channel used between the
+            Raspberry Pi and the ESP32-S3. Do not share this channel with the
+            ESP-IDF log console, otherwise log text will corrupt JSON Lines.
+
+        config ELDER_COMMS_USB_SERIAL_JTAG
+            bool "ESP32-S3 USB Serial/JTAG"
+
+        config ELDER_COMMS_UART
+            bool "Hardware UART"
+    endchoice
+
+    config ELDER_JSON_LINE_MAX_LENGTH
+        int "Maximum JSON line length"
+        range 128 2048
+        default 2048
+        help
+            Lines longer than this value are discarded through the next LF.
+            This bound prevents an untrusted peer from growing receive memory.
+
+    config ELDER_COMMS_RX_TASK_STACK_SIZE
+        int "Serial receive task stack size"
+        range 3072 8192
+        default 6144
+
+    config ELDER_COMMS_RX_TASK_PRIORITY
+        int "Serial receive task priority"
+        range 1 20
+        default 8
+
+    config ELDER_COMMS_TX_TIMEOUT_MS
+        int "JSON line transmit timeout (ms)"
+        range 20 5000
+        default 250
+
+    if ELDER_COMMS_USB_SERIAL_JTAG
+        config ELDER_USB_RX_BUFFER_SIZE
+            int "USB Serial/JTAG RX buffer size"
+            range 256 4096
+            default 1024
+
+        config ELDER_USB_TX_BUFFER_SIZE
+            int "USB Serial/JTAG TX buffer size"
+            range 256 4096
+            default 1024
+    endif
+
+    if ELDER_COMMS_UART
+        config ELDER_UART_PORT
+            int "UART controller number"
+            range 0 2
+            default 1
+
+        config ELDER_UART_BAUD_RATE
+            int "UART baud rate"
+            range 9600 2000000
+            default 115200
+
+        config ELDER_UART_TX_GPIO
+            int "UART TX GPIO (-1 keeps an existing routing)"
+            range -1 48
+            default -1
+
+        config ELDER_UART_RX_GPIO
+            int "UART RX GPIO (-1 keeps an existing routing)"
+            range -1 48
+            default -1
+
+        config ELDER_UART_RX_BUFFER_SIZE
+            int "UART RX buffer size"
+            range 256 4096
+            default 1024
+
+        config ELDER_UART_TX_BUFFER_SIZE
+            int "UART TX buffer size"
+            range 256 4096
+            default 1024
+    endif
+
+    config ELDER_HEARTBEAT_INTERVAL_MS
+        int "Heartbeat interval (ms)"
+        range 1000 60000
+        default 5000
+
+    config ELDER_HEARTBEAT_TASK_STACK_SIZE
+        int "Heartbeat task stack size"
+        range 2048 4096
+        default 3072
+
+    config ELDER_BOOT_ANIMATION_MS
+        int "Boot-state display duration (ms)"
+        range 0 10000
+        default 1200
+
+    menu "External buttons"
+        config ELDER_WAKE_BUTTON_ENABLED
+            bool "Enable external WAKE button"
+            default n
+
+        if ELDER_WAKE_BUTTON_ENABLED
+            config ELDER_WAKE_BUTTON_GPIO
+                int "WAKE button GPIO"
+                range -1 48
+                default -1
+
+            config ELDER_WAKE_BUTTON_ACTIVE_LOW
+                bool "WAKE button is active-low"
+                default y
+        endif
+
+        config ELDER_STOP_BUTTON_ENABLED
+            bool "Enable external STOP button"
+            default n
+
+        if ELDER_STOP_BUTTON_ENABLED
+            config ELDER_STOP_BUTTON_GPIO
+                int "STOP button GPIO"
+                range -1 48
+                default -1
+
+            config ELDER_STOP_BUTTON_ACTIVE_LOW
+                bool "STOP button is active-low"
+                default y
+        endif
+
+        config ELDER_BUTTON_INTERNAL_PULL
+            bool "Enable matching internal pull resistor"
+            default y
+            help
+                An active-low input gets a pull-up and an active-high input a
+                pull-down. Disable this when the final board/BSP supplies its
+                own biasing network.
+
+        config ELDER_BUTTON_POLL_INTERVAL_MS
+            int "Button polling interval (ms)"
+            range 5 100
+            default 20
+
+        config ELDER_BUTTON_DEBOUNCE_MS
+            int "Button debounce time (ms)"
+            range 20 500
+            default 60
+
+        config ELDER_BUTTON_TASK_STACK_SIZE
+            int "Button task stack size"
+            range 2048 4096
+            default 3072
+    endmenu
+
+endmenu

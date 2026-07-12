@@ -1,0 +1,32 @@
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+
+# Runtime data (must never be committed)
+*.db
+*.db-shm
+*.db-wal
+pi-backend/data/
+pi-backend/logs/
+
+# ESP-IDF generated files
+esp32-firmware/build/
+esp32-firmware/sdkconfig
+esp32-firmware/sdkconfig.old
+esp32-firmware/dependencies.lock
+*.plist
+
+# Generated mock media
+*.wav

@@ -1,0 +1,9 @@
+# Keep diagnostic logs away from the default JSON Lines transport. The
+# firmware uses the ESP32-S3 USB Serial/JTAG peripheral for protocol traffic
+# by default, while ESP-IDF logs remain on UART0.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Reasonable FreeRTOS timer/task defaults for this small Phase-2 skeleton.
+CONFIG_FREERTOS_HZ=1000
