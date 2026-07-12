@@ -7,3 +7,22 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
 # Reasonable FreeRTOS timer/task defaults for this small Phase-2 skeleton.
 CONFIG_FREERTOS_HZ=1000
+
+# --- Waveshare ESP32-S3-Touch-AMOLED-1.8 display adapter -------------------
+# Values mirror the official BSP example (14_lvgl_demo_v9). The LVGL build
+# needs the 16MB flash / 8MB factory partition and octal PSRAM.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# LVGL fonts: default UI font, large symbols, and the built-in CJK font so
+# Chinese display names ("张奶奶") and error messages can render.
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_SIMSUN_16_CJK=y

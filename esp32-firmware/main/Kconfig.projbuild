@@ -97,6 +97,16 @@ menu "Elder companion firmware"
         range 0 10000
         default 1200
 
+    config ELDER_UI_BOARD_AMOLED18
+        bool "Render UI on Waveshare ESP32-S3-Touch-AMOLED-1.8"
+        default y
+        help
+            Draw faces and states on the Waveshare 1.8" AMOLED through the
+            official managed BSP (waveshare/esp32_s3_touch_amoled_1_8).
+            All expression elements live inside a circular canvas sized
+            min(width, height), so the same code later ports to the round
+            1.43C target. Disable to fall back to the log-only UI stub.
+
     menu "External buttons"
         config ELDER_WAKE_BUTTON_ENABLED
             bool "Enable external WAKE button"

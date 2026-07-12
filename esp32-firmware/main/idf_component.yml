@@ -1,0 +1,11 @@
+version: "1.0.0"
+
+dependencies:
+  idf: ">=5.5,<6.0"
+  # Official Waveshare managed BSP for ESP32-S3-Touch-AMOLED-1.8.
+  # Owns SH8601 QSPI panel + FT3168 touch + LVGL9 init and all pin mapping,
+  # so this repository still never hard-codes board GPIOs.
+  # Used only when CONFIG_ELDER_UI_BOARD_AMOLED18=y (see Kconfig.projbuild).
+  waveshare/esp32_s3_touch_amoled_1_8:
+    version: "^2.0.1"
+    public: true
