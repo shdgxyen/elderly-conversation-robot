@@ -107,6 +107,16 @@ menu "Elder companion firmware"
             min(width, height), so the same code later ports to the round
             1.43C target. Disable to fall back to the log-only UI stub.
 
+    config ELDER_UI_MOTION
+        bool "IMU motion reactions (gaze follow + dizzy)"
+        default y
+        depends on ELDER_UI_BOARD_AMOLED18
+        help
+            Sample the on-board QMI8658 IMU: tilting the board makes the
+            eyes look downhill; shaking it plays a short dizzy animation.
+            Only active in quiet states (IDLE / welcome / comfort), never
+            during conversation, privacy or error states.
+
     menu "External buttons"
         config ELDER_WAKE_BUTTON_ENABLED
             bool "Enable external WAKE button"

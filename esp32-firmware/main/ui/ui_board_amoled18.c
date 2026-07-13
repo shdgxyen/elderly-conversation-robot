@@ -27,6 +27,7 @@
 
 #include "app_state.h"
 #include "ui_board.h"
+#include "ui_board_amoled18.h"
 
 static const char *TAG = "ui_amoled18";
 
@@ -52,12 +53,25 @@ static lv_obj_t *s_flat;    /* flat mouth, rounded bar */
 static lv_obj_t *s_open;    /* round/open mouth (listening, speaking) */
 static lv_obj_t *s_status;  /* large symbol / thinking dots */
 static lv_obj_t *s_caption; /* CJK text: names, error messages */
+static lv_obj_t *s_star[3]; /* orbiting sparks for the dizzy animation */
+static lv_obj_t *s_hl_l;    /* eye highlight dots (clipped inside the eyes) */
+static lv_obj_t *s_hl_r;
 
 static lv_timer_t *s_blink_timer;
 static lv_timer_t *s_think_timer;
 static bool s_blink_enabled;
 static int s_think_phase;
 static bool s_dimmed;
+
+/* Motion interactivity (fed by the IMU task through the public hooks).
+ * Gaze values are stored as milli-units so 32-bit writes stay atomic. */
+static app_state_t s_current_state = APP_STATE_BOOTING;
+static volatile int32_t s_gaze_x_mil;
+static volatile int32_t s_gaze_y_mil;
+static volatile bool s_shake_pending;
+static bool s_dizzy_active;
+static lv_timer_t *s_motion_timer;
+static lv_timer_t *s_dizzy_end_timer;
 
 static int32_t s_eye_w, s_eye_h; /* current nominal eye size */
 
@@ -82,6 +96,11 @@ static void anim_translate_x(void *obj, int32_t v)
     lv_obj_set_style_translate_x((lv_obj_t *)obj, v, 0);
 }
 
+static void anim_translate_y(void *obj, int32_t v)
+{
+    lv_obj_set_style_translate_y((lv_obj_t *)obj, v, 0);
+}
+
 static void blink_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -93,6 +112,7 @@ static void blink_timer_cb(lv_timer_t *timer)
     lv_anim_set_values(&a, s_eye_h, FD(2));
     lv_anim_set_duration(&a, 90);
     lv_anim_set_playback_duration(&a, 120);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
     lv_anim_set_exec_cb(&a, anim_set_height);
     lv_anim_set_var(&a, s_eye_l);
     lv_anim_start(&a);
@@ -118,8 +138,19 @@ static void stop_dynamics(void)
     lv_anim_delete(s_eye_l, NULL);
     lv_anim_delete(s_eye_r, NULL);
     lv_anim_delete(s_open, NULL);
+    lv_anim_delete(s_face, NULL);
     lv_obj_set_style_translate_x(s_eye_l, 0, 0);
     lv_obj_set_style_translate_x(s_eye_r, 0, 0);
+    lv_obj_set_style_translate_y(s_eye_l, 0, 0);
+    lv_obj_set_style_translate_y(s_eye_r, 0, 0);
+    lv_obj_set_style_translate_x(s_face, 0, 0);
+    lv_obj_set_style_translate_y(s_open, 0, 0);
+    for (size_t i = 0; i < 3; i++) {
+        if (s_star[i] != NULL) {
+            lv_anim_delete(s_star[i], NULL);
+            lv_obj_add_flag(s_star[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }
 
 static void set_eyes(int32_t w, int32_t h, int32_t dy, lv_color_t color)
@@ -130,8 +161,15 @@ static void set_eyes(int32_t w, int32_t h, int32_t dy, lv_color_t color)
     lv_obj_set_size(s_eye_r, w, h);
     lv_obj_align(s_eye_l, LV_ALIGN_CENTER, -FD(22), dy);
     lv_obj_align(s_eye_r, LV_ALIGN_CENTER, FD(22), dy);
-    lv_obj_set_style_bg_color(s_eye_l, color, 0);
-    lv_obj_set_style_bg_color(s_eye_r, color, 0);
+
+    /* Subtle vertical sheen: base color on top fading darker below. */
+    const lv_color_t shade = lv_color_darken(color, 70);
+    lv_obj_t *eyes[] = {s_eye_l, s_eye_r};
+    for (size_t i = 0; i < 2; i++) {
+        lv_obj_set_style_bg_color(eyes[i], color, 0);
+        lv_obj_set_style_bg_grad_color(eyes[i], shade, 0);
+        lv_obj_set_style_bg_grad_dir(eyes[i], LV_GRAD_DIR_VER, 0);
+    }
 }
 
 static void set_mouth(mouth_mode_t mode, lv_color_t color, int32_t weight)
@@ -179,6 +217,7 @@ static void set_mouth(mouth_mode_t mode, lv_color_t color, int32_t weight)
         lv_anim_set_duration(&a, 180);
         lv_anim_set_playback_duration(&a, 160);
         lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
         lv_anim_set_exec_cb(&a, anim_set_height);
         lv_anim_start(&a);
         break;
@@ -216,7 +255,8 @@ static lv_color_t col_alert(void)  { return lv_color_hex(0xFF8A7A); }
 
 static void expr_neutral(void)
 {
-    set_eyes(FD(14), FD(18), -FD(10), col_eye());
+    /* Tall capsule eyes (height ~2x width) read as friendly and alert. */
+    set_eyes(FD(12), FD(24), -FD(10), col_eye());
     set_mouth(MOUTH_SMILE, col_eye(), FD(3));
     set_texts(NULL, NULL);
 }
@@ -238,6 +278,14 @@ static void expr_sad(const char *symbol, const char *caption)
 
 static void apply_state(app_state_t state)
 {
+    /* Any explicit state render cancels an in-flight dizzy overlay. */
+    s_current_state = state;
+    s_dizzy_active = false;
+    if (s_dizzy_end_timer != NULL) {
+        lv_timer_delete(s_dizzy_end_timer);
+        s_dizzy_end_timer = NULL;
+    }
+
     stop_dynamics();
 
     switch (state) {
@@ -260,6 +308,7 @@ static void apply_state(app_state_t state)
         lv_anim_set_duration(&a, 700);
         lv_anim_set_playback_duration(&a, 700);
         lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
         lv_anim_set_exec_cb(&a, anim_translate_x);
         lv_anim_set_var(&a, s_eye_l);
         lv_anim_start(&a);
@@ -274,12 +323,12 @@ static void apply_state(app_state_t state)
         expr_neutral();
         break;
     case APP_STATE_LISTENING:
-        set_eyes(FD(16), FD(22), -FD(10), col_accent());
+        set_eyes(FD(14), FD(28), -FD(10), col_accent());
         set_mouth(MOUTH_O, col_eye(), 0);
         set_texts(NULL, NULL);
         break;
     case APP_STATE_THINKING:
-        set_eyes(FD(13), FD(15), -FD(14), col_eye());
+        set_eyes(FD(11), FD(18), -FD(14), col_eye());
         set_mouth(MOUTH_FLAT, col_eye(), FD(2));
         set_texts(".", NULL);
         s_think_phase = 0;
@@ -291,7 +340,7 @@ static void apply_state(app_state_t state)
         set_texts(NULL, NULL);
         break;
     case APP_STATE_CONFUSED:
-        set_eyes(FD(14), FD(18), -FD(10), col_eye());
+        set_eyes(FD(12), FD(22), -FD(10), col_eye());
         lv_obj_set_size(s_eye_r, FD(11), FD(11)); /* asymmetric eyes */
         set_mouth(MOUTH_FLAT, col_eye(), FD(2));
         set_texts("?", NULL);
@@ -337,6 +386,165 @@ static void apply_state(app_state_t state)
     }
 }
 
+/* --- motion interactivity (gaze follow + dizzy) --------------------------- */
+
+/* Motion effects only run in quiet states so they never fight with the
+ * conversation, privacy or error expressions. */
+static bool motion_allowed(void)
+{
+    switch (s_current_state) {
+    case APP_STATE_IDLE:
+    case APP_STATE_UNKNOWN_USER:
+    case APP_STATE_USER_RECOGNIZED:
+    case APP_STATE_COMFORT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void dizzy_end_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    s_dizzy_end_timer = NULL;
+    s_dizzy_active = false;
+    apply_state(s_current_state); /* restore the underlying expression */
+}
+
+static void dizzy_begin(void)
+{
+    s_dizzy_active = true;
+    stop_dynamics();
+
+    /* 1. Eyes: squeezed almost shut ("ugh...") and drifting slowly. */
+    set_eyes(FD(15), FD(4), -FD(8), col_eye());
+    lv_anim_t sway_eye;
+    lv_anim_init(&sway_eye);
+    lv_anim_set_values(&sway_eye, -FD(2), FD(2));
+    lv_anim_set_duration(&sway_eye, 420);
+    lv_anim_set_playback_duration(&sway_eye, 420);
+    lv_anim_set_repeat_count(&sway_eye, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_path_cb(&sway_eye, lv_anim_path_ease_in_out);
+    lv_anim_set_exec_cb(&sway_eye, anim_translate_y);
+    lv_anim_set_var(&sway_eye, s_eye_l);
+    lv_anim_start(&sway_eye);
+    lv_anim_set_delay(&sway_eye, 210);
+    lv_anim_set_var(&sway_eye, s_eye_r);
+    lv_anim_start(&sway_eye);
+
+    /* 2. Whole face sways side to side, like losing balance. */
+    lv_anim_t sway_face;
+    lv_anim_init(&sway_face);
+    lv_anim_set_var(&sway_face, s_face);
+    lv_anim_set_values(&sway_face, -FD(3), FD(3));
+    lv_anim_set_duration(&sway_face, 480);
+    lv_anim_set_playback_duration(&sway_face, 480);
+    lv_anim_set_repeat_count(&sway_face, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_path_cb(&sway_face, lv_anim_path_ease_in_out);
+    lv_anim_set_exec_cb(&sway_face, anim_translate_x);
+    lv_anim_start(&sway_face);
+
+    /* 3. Cartoon sparks orbiting above the head (the classic dizzy halo):
+     *    each spark runs an x- and a y-anim 90 degrees out of phase, and
+     *    the three sparks are offset by a third of a period. */
+    const int32_t orbit_rx = FD(16);
+    const int32_t orbit_ry = FD(5);
+    const uint32_t half_period = 380;
+    for (size_t i = 0; i < 3; i++) {
+        if (s_star[i] == NULL) {
+            continue;
+        }
+        face_clear_flag(s_star[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_align(s_star[i], LV_ALIGN_CENTER, 0, -FD(32));
+
+        lv_anim_t ox;
+        lv_anim_init(&ox);
+        lv_anim_set_var(&ox, s_star[i]);
+        lv_anim_set_values(&ox, -orbit_rx, orbit_rx);
+        lv_anim_set_duration(&ox, half_period);
+        lv_anim_set_playback_duration(&ox, half_period);
+        lv_anim_set_repeat_count(&ox, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_delay(&ox, (uint32_t)i * (2 * half_period / 3));
+        /* ease-in-out on both axes approximates a sine, so the two
+         * out-of-phase animations trace a smooth ellipse. */
+        lv_anim_set_path_cb(&ox, lv_anim_path_ease_in_out);
+        lv_anim_set_exec_cb(&ox, anim_translate_x);
+        lv_anim_start(&ox);
+
+        lv_anim_t oy;
+        lv_anim_init(&oy);
+        lv_anim_set_var(&oy, s_star[i]);
+        lv_anim_set_values(&oy, -orbit_ry, orbit_ry);
+        lv_anim_set_duration(&oy, half_period);
+        lv_anim_set_playback_duration(&oy, half_period);
+        lv_anim_set_repeat_count(&oy, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_delay(&oy, (uint32_t)i * (2 * half_period / 3) + half_period / 2);
+        lv_anim_set_path_cb(&oy, lv_anim_path_ease_in_out);
+        lv_anim_set_exec_cb(&oy, anim_translate_y);
+        lv_anim_start(&oy);
+    }
+
+    /* 4. Small wobbly mouth bobbing up and down. */
+    set_mouth(MOUTH_O, col_eye(), 0);
+    lv_anim_t bob;
+    lv_anim_init(&bob);
+    lv_anim_set_var(&bob, s_open);
+    lv_anim_set_values(&bob, -FD(1), FD(2));
+    lv_anim_set_duration(&bob, 300);
+    lv_anim_set_playback_duration(&bob, 300);
+    lv_anim_set_repeat_count(&bob, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_path_cb(&bob, lv_anim_path_ease_in_out);
+    lv_anim_set_exec_cb(&bob, anim_translate_y);
+    lv_anim_start(&bob);
+
+    set_texts(NULL, NULL);
+
+    s_dizzy_end_timer = lv_timer_create(dizzy_end_cb, 2800, NULL);
+    lv_timer_set_repeat_count(s_dizzy_end_timer, 1);
+}
+
+/* Runs in the LVGL task every 40 ms: consumes the values published by the
+ * IMU task. No cross-thread LVGL calls anywhere. */
+static void motion_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    if (s_shake_pending) {
+        s_shake_pending = false;
+        if (motion_allowed() && !s_dizzy_active) {
+            dizzy_begin();
+        }
+    }
+
+    if (s_dizzy_active || !motion_allowed()) {
+        return;
+    }
+
+    /* Horizontal follow is the dominant, most readable cue; vertical
+     * movement is damped so the face keeps eye contact with the user. */
+    const int32_t max_x = FD(8);
+    const int32_t max_y = FD(5);
+    const int32_t dx = (int32_t)((int64_t)s_gaze_x_mil * max_x / 1000);
+    const int32_t dy = (int32_t)((int64_t)s_gaze_y_mil * max_y / 1000);
+    lv_obj_set_style_translate_x(s_eye_l, dx, 0);
+    lv_obj_set_style_translate_x(s_eye_r, dx, 0);
+    lv_obj_set_style_translate_y(s_eye_l, dy, 0);
+    lv_obj_set_style_translate_y(s_eye_r, dy, 0);
+}
+
+void ui_amoled18_set_gaze(float x, float y)
+{
+    if (x > 1.0f) { x = 1.0f; } else if (x < -1.0f) { x = -1.0f; }
+    if (y > 1.0f) { y = 1.0f; } else if (y < -1.0f) { y = -1.0f; }
+    s_gaze_x_mil = (int32_t)(x * 1000.0f);
+    s_gaze_y_mil = (int32_t)(y * 1000.0f);
+}
+
+void ui_amoled18_notify_shake(void)
+{
+    s_shake_pending = true;
+}
+
 /* --- face construction --------------------------------------------------- */
 
 static void build_face(void)
@@ -353,7 +561,11 @@ static void build_face(void)
     lv_obj_set_size(s_face, s_d, s_d);
     lv_obj_center(s_face);
     lv_obj_set_style_radius(s_face, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(s_face, lv_color_hex(0x101418), 0);
+    /* Deep blue-grey vertical gradient gives the "sphere" some depth while
+     * staying near-black for the AMOLED panel. */
+    lv_obj_set_style_bg_color(s_face, lv_color_hex(0x18222E), 0);
+    lv_obj_set_style_bg_grad_color(s_face, lv_color_hex(0x0A0E13), 0);
+    lv_obj_set_style_bg_grad_dir(s_face, LV_GRAD_DIR_VER, 0);
     lv_obj_set_style_border_width(s_face, 0, 0);
     lv_obj_set_style_pad_all(s_face, 0, 0);
     face_clear_flag(s_face, LV_OBJ_FLAG_SCROLLABLE);
@@ -364,7 +576,25 @@ static void build_face(void)
     for (size_t i = 0; i < 2; i++) {
         lv_obj_set_style_radius(eyes[i], LV_RADIUS_CIRCLE, 0);
         lv_obj_set_style_border_width(eyes[i], 0, 0);
+        /* Children (the highlight dot) are clipped by the rounded shape,
+         * so the highlight vanishes cleanly when the eye blinks shut. */
+        lv_obj_set_style_clip_corner(eyes[i], true, 0);
+        lv_obj_set_style_pad_all(eyes[i], 0, 0);
         face_clear_flag(eyes[i], LV_OBJ_FLAG_SCROLLABLE);
+    }
+
+    /* Catch-light: a soft white dot in the upper-left of each eye. */
+    s_hl_l = lv_obj_create(s_eye_l);
+    s_hl_r = lv_obj_create(s_eye_r);
+    lv_obj_t *hls[] = {s_hl_l, s_hl_r};
+    for (size_t i = 0; i < 2; i++) {
+        lv_obj_set_size(hls[i], FD(4), FD(4));
+        lv_obj_set_style_radius(hls[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_border_width(hls[i], 0, 0);
+        lv_obj_set_style_bg_color(hls[i], lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(hls[i], LV_OPA_70, 0);
+        lv_obj_align(hls[i], LV_ALIGN_TOP_LEFT, FD(2), FD(2));
+        face_clear_flag(hls[i], LV_OBJ_FLAG_SCROLLABLE);
     }
 
     s_smile = lv_arc_create(s_face);
@@ -383,6 +613,17 @@ static void build_face(void)
     lv_obj_set_style_radius(s_open, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_border_width(s_open, 0, 0);
 
+    /* Dizzy sparks: small pastel dots, hidden until a shake is detected. */
+    static const uint32_t star_palette[3] = {0xFFC48A, 0xFFA0B4, 0x7FDBFF};
+    for (size_t i = 0; i < 3; i++) {
+        s_star[i] = lv_obj_create(s_face);
+        lv_obj_set_size(s_star[i], FD(3), FD(3));
+        lv_obj_set_style_radius(s_star[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_border_width(s_star[i], 0, 0);
+        lv_obj_set_style_bg_color(s_star[i], lv_color_hex(star_palette[i]), 0);
+        lv_obj_add_flag(s_star[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
     s_status = lv_label_create(s_face);
 #if LV_FONT_MONTSERRAT_24
     lv_obj_set_style_text_font(s_status, &lv_font_montserrat_24, 0);
@@ -400,6 +641,7 @@ static void build_face(void)
     lv_obj_align(s_caption, LV_ALIGN_CENTER, 0, FD(34));
 
     s_blink_timer = lv_timer_create(blink_timer_cb, 3500, NULL);
+    s_motion_timer = lv_timer_create(motion_timer_cb, 40, NULL);
 
     apply_state(APP_STATE_BOOTING);
 }
@@ -441,11 +683,12 @@ esp_err_t ui_board_play_boot_animation(void)
         return ESP_ERR_TIMEOUT;
     }
     apply_state(APP_STATE_BOOTING);
-    /* eyes open slowly, then a smile appears */
+    /* Eyes pop open with a slight overshoot, then a smile appears. */
     lv_anim_t a;
     lv_anim_init(&a);
-    lv_anim_set_values(&a, FD(2), FD(18));
-    lv_anim_set_duration(&a, 600);
+    lv_anim_set_values(&a, FD(2), FD(24));
+    lv_anim_set_duration(&a, 650);
+    lv_anim_set_path_cb(&a, lv_anim_path_overshoot);
     lv_anim_set_exec_cb(&a, anim_set_height);
     lv_anim_set_var(&a, s_eye_l);
     lv_anim_start(&a);

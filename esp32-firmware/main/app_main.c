@@ -13,6 +13,10 @@
 #include "ui.h"
 #include "usb_serial.h"
 
+#if CONFIG_ELDER_UI_MOTION
+#include "motion.h"
+#endif
+
 static const char *TAG = "app_main";
 
 static void handle_serial_line(const char *line, size_t length, void *context)
@@ -81,6 +85,14 @@ void app_main(void)
         ESP_LOGE(TAG, "heartbeat initialization failed: %s",
                  esp_err_to_name(heartbeat_result));
     }
+
+#if CONFIG_ELDER_UI_MOTION
+    /* Motion features are best-effort: a missing IMU only logs a warning. */
+    const esp_err_t motion_result = motion_start();
+    if (motion_result != ESP_OK && motion_result != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "motion init failed: %s", esp_err_to_name(motion_result));
+    }
+#endif
 
     ESP_LOGI(TAG, "ready; protocol transport=%s", usb_serial_transport_name());
 }

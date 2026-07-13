@@ -9,3 +9,7 @@ dependencies:
   waveshare/esp32_s3_touch_amoled_1_8:
     version: "^2.0.1"
     public: true
+  # On-board QMI8658 six-axis IMU (gaze follow + shake/dizzy reactions).
+  waveshare/qmi8658:
+    version: "^2.0.0"
+    public: true

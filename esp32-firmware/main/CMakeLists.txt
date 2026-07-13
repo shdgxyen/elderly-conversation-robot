@@ -16,6 +16,7 @@ idf_component_register(
         "ui/ui_states.c"
         "ui/ui_faces.c"
         "${ELDER_UI_BOARD_SRC}"
+        "motion/motion.c"
         "input/buttons.c"
         "comms/usb_serial.c"
         "comms/heartbeat.c"
@@ -23,6 +24,7 @@ idf_component_register(
         "."
         "protocol"
         "ui"
+        "motion"
         "input"
         "comms"
     PRIV_REQUIRES
@@ -33,6 +35,7 @@ idf_component_register(
         esp_driver_usb_serial_jtag
         esp32_s3_touch_amoled_1_8
         lvgl__lvgl
+        qmi8658
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
