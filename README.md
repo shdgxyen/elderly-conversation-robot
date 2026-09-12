@@ -15,6 +15,8 @@
 
 要求 Python 3.11 或更高版本。在仓库根目录执行：
 
+Windows 10/11 用户请先阅读 [`docs/WINDOWS_SETUP.md`](docs/WINDOWS_SETUP.md)，其中包含 PowerShell、Python、ESP-IDF、烧录和串口联调的完整步骤。
+
 ```bash
 make setup
 cp pi-backend/.env.example pi-backend/.env
@@ -57,6 +59,6 @@ web-admin/          后续阶段预留
 
 ## 当前边界
 
-本阶段不会保存原始音频或视频；不会接入真实 STT、LLM、TTS、人脸识别或自传生成。Mock 实现都位于清晰接口之后，后续可以替换而不改动 API 和数据层。ESP32 的状态、协议、心跳和按键逻辑已实现；由于仓库未携带微雪 BSP/LVGL，实际 AMOLED 绘制目前走可替换 UI 适配层和日志回退，接板步骤见固件 README。
+本阶段不会持久化原始音频或视频；尚未接入真实 STT、LLM、TTS、人脸识别或自传生成。圆形 ESP32-S3-Touch-AMOLED-1.43C 已接入原生 LVGL 动态表情，并提供板载双麦克风到内置喇叭的三秒录音回放验证；这只证明本地音频硬件链路，不代表云端语音对话已经完成。详细烧录与 BOOT 键重复测试方法见固件 README。
 
 详细目标与约束以 [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) 为准。
