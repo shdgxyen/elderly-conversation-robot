@@ -43,6 +43,39 @@ returned device state is `SPEAKING`.
 
 Interactive documentation is available at <http://127.0.0.1:8000/docs>.
 
+## Optional Qwen text backend (Alibaba Cloud)
+
+The default remains the local `MockLLM`. To test a single real text turn through
+Alibaba Cloud Bailian, put the following values in the local `pi-backend/.env`
+file:
+
+```dotenv
+ELDER_ROBOT_LLM_BACKEND=qwen
+ELDER_ROBOT_QWEN_API_KEY=your-local-api-key
+ELDER_ROBOT_QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+ELDER_ROBOT_QWEN_MODEL=qwen-plus
+ELDER_ROBOT_QWEN_MAX_TOKENS=2048
+ELDER_ROBOT_QWEN_ENABLE_THINKING=false
+```
+
+Bailian exposes an OpenAI-compatible endpoint, so the client only needs a base
+URL, a bearer key, and a model name. Keep `ELDER_ROBOT_QWEN_ENABLE_THINKING`
+set to `false`: Qwen3 models reject non-streaming requests while thinking is on.
+Omit the variable entirely to fall back to the model default. Outside mainland
+China, use `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` instead.
+
+Kimi remains available as `ELDER_ROBOT_LLM_BACKEND=kimi` with the
+`ELDER_ROBOT_KIMI_*` variables; see `.env.example` for the full list.
+
+Do not send the API key through chat, put it in source code, or commit `.env`.
+The repository ignores `pi-backend/.env`. The request sends the companion system
+prompt and the current user text only; conversation-history retrieval is not part
+of this single-turn integration. It also does not yet replace the mock STT, TTS,
+or audio playback boundaries.
+
+The test suite is isolated from `.env` and from `ELDER_ROBOT_` variables, so
+enabling a real backend locally never makes `pytest` issue billable requests.
+
 ## Optional ESP32 connection
 
 Device communication is disabled by default, so the API starts without

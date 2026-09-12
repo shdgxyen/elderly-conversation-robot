@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,7 +34,22 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/elder_companion.db"
     database_echo: bool = False
 
-    llm_backend: str = "mock"
+    llm_backend: Literal["mock", "kimi", "qwen"] = "mock"
+    kimi_api_key: SecretStr | None = None
+    kimi_base_url: str = "https://api.moonshot.cn/v1"
+    kimi_model: str = "kimi-k3"
+    kimi_reasoning_effort: Literal["low", "high", "max"] = "low"
+    kimi_max_completion_tokens: int = Field(default=2048, ge=256, le=8192)
+    kimi_connect_timeout_seconds: float = Field(default=5.0, gt=0)
+    kimi_read_timeout_seconds: float = Field(default=60.0, gt=0)
+    qwen_api_key: SecretStr | None = None
+    qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    qwen_model: str = "qwen-plus"
+    qwen_max_tokens: int = Field(default=2048, ge=256, le=8192)
+    # Leave unset to use the model default; Qwen3 needs false when not streaming.
+    qwen_enable_thinking: bool | None = None
+    qwen_connect_timeout_seconds: float = Field(default=5.0, gt=0)
+    qwen_read_timeout_seconds: float = Field(default=60.0, gt=0)
     stt_backend: str = "mock"
     tts_backend: str = "mock"
     audio_backend: str = "mock"
