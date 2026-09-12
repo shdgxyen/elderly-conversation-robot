@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#if CONFIG_ELDER_UI_BOARD_AMOLED18
+#if CONFIG_ELDER_UI_BOARD_AMOLED143C
 
 /**
  * Motion hooks for the AMOLED-1.8 face adapter. Both functions are
@@ -21,7 +21,7 @@ void ui_amoled18_set_gaze(float x, float y);
  *  current state allows it (quiet states only). */
 void ui_amoled18_notify_shake(void);
 
-#endif /* CONFIG_ELDER_UI_BOARD_AMOLED18 */
+#endif /* CONFIG_ELDER_UI_BOARD_AMOLED143C */
 
 #ifdef __cplusplus
 }

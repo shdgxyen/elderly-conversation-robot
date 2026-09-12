@@ -1,4 +1,4 @@
-# ESP32-S3 firmware (Phase 0 / Phase 2)
+# ESP32-S3 firmware for the 1.43C round terminal
 
 This directory contains the ESP-IDF skeleton for the round-screen terminal in
 `docs/PROJECT_SPEC.md`. Its current responsibility is deliberately small:
@@ -7,10 +7,12 @@ This directory contains the ESP-IDF skeleton for the round-screen terminal in
 - receive bounded JSON Lines commands from the Raspberry Pi;
 - expose state, face, user, error, brightness, and prompt-sound UI actions;
 - report periodic heartbeats and debounced WAKE/STOP events;
-- provide a clean UI hardware-adapter boundary for the Waveshare BSP.
+- render native animated expressions on the 466 x 466 round AMOLED;
+- verify the built-in ES7210 microphones and ES8311 speaker path.
 
-The real microphone, speaker, touch controller, face camera, and full LVGL
-graphics/audio path are outside this phase. `sound` is a visible/log mock.
+The microphone/speaker record-and-replay path is now real hardware. Touch,
+camera, cloud STT/LLM/TTS, and named prompt sounds are still outside this
+verification build; the JSON `sound` command therefore remains a log mock.
 
 ## Recommended toolchain
 
@@ -20,17 +22,14 @@ Use the vendor demo as the integration baseline:
 - [Waveshare official demo repository](https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-1.43C), currently containing an `espidf_v5.5.3` example
 - ESP-IDF 5.5.x, preferably 5.5.3 to match that demo
 
-The current official LVGL 9 BSP port declares ESP-IDF `>=5.5`, LVGL `^9.4.0`
-(the demo currently uses 9.5.0), `esp_lvgl_adapter ^0.4.1`, and
-`esp_lcd_sh8601 ^2.0.1`. Those managed components are intentionally **not**
-added yet: this phase must remain buildable without copying vendor code or
-assuming its license/integration choices.
+The firmware uses ESP-IDF 5.5.3, LVGL 9.5, `esp_lvgl_adapter`, the SH8601
+display driver, and the same `codec_board` 2.0.0 / `esp_codec_dev` 1.5.4 audio
+stack used by the vendor's ESP-IDF audio example.
 
-The documented module is ESP32-S3-PICO-1-N8R8 with a 466 x 466 CO5300 AMOLED
-and CST820 touch controller. The official board configuration identifies its
-on-board BOOT key as GPIO0 and LED as GPIO5. These facts are recorded only to
-guide the later BSP integration. This project does not repurpose either pin or
-guess GPIOs for the product's external WAKE and STOP controls.
+The module is ESP32-S3-PICO-1-N8R8 with a 466 x 466 AMOLED and CST820 touch
+controller. The audio verification task uses the on-board BOOT key (GPIO0) to
+repeat a test; the separately configurable external WAKE and STOP inputs stay
+disabled by default.
 
 ## Build and flash
 
@@ -126,26 +125,50 @@ the confirmed GPIO number and polarity. A configured `-1` pin is rejected at
 startup. Inputs are polled and debounced in a FreeRTOS task; callbacks run only
 on a stable press, not continuously while held.
 
-## UI / Waveshare BSP integration point
+With `ELDER_AUDIO_LOOPBACK_TEST` enabled, GPIO0 is reserved for the on-board
+BOOT key. Do not assign an external WAKE/STOP input to GPIO0 at the same time.
 
-The public UI facade is in `main/ui/ui.h`. Hardware-specific work belongs behind
-`main/ui/ui_board.h`. The shipped weak functions return
-`ESP_ERR_NOT_SUPPORTED`, and the facade falls back to structured ESP-IDF logs.
-To connect the official display/LVGL port later:
+## On-board microphone and speaker test
 
-1. add the reviewed vendor/managed components under `components/` or the IDF
-   component manager;
-2. provide strong implementations of `ui_board_init`, `ui_board_show_state`,
-   `ui_board_play_boot_animation`, `ui_board_show_face`, `ui_board_show_user`,
-   `ui_board_show_error`, and `ui_board_set_brightness`;
-3. make the adapter own LVGL display/touch initialization and translate the
-   state enum into animations; calls through the facade are serialized, but an
-   adapter that queues work must copy borrowed string arguments and use its own
-   LVGL task lock;
-4. implement `ui_board_play_sound` only when the real audio BSP is introduced.
+The default build runs one test automatically after startup:
 
-No Waveshare BSP or LVGL source has been copied into this skeleton, and no
-panel/touch/audio pin mapping is fabricated.
+1. wait for the short cue, then start speaking when the listening expression appears;
+2. speak for three seconds;
+3. listen while the speaking expression replays the recording;
+4. press and release BOOT to repeat without reflashing.
+
+The speaker keeps the vendor example's 100% volume. Recording uses the ES7210's
+native four-channel, 16-bit TDM frame at 30 dB analog gain; playback is closed
+during capture, then the buffer is converted to two-channel, 16-bit audio before
+the ES8311 is reopened. Live board telemetry identifies TDM slots 0 and 2 as
+the two physical microphone signals; the nearly empty slots 1 and 3 remain in
+the raw capture for format correctness and diagnostics. The AEC/reference and
+unused logical channels are held at 0 dB while the two physical microphones use
+30 dB. Before replay, the firmware applies a 100 Hz high-pass and 3.8 kHz
+Butterworth low-pass, estimates noise and voice levels from the whole recording,
+selects the better-SNR microphone, and uses a 60 ms look-ahead soft expander
+with an 80 ms tail hold. Automatic gain uses only detected voice frames and is capped
+at 2x; a soft-knee limiter avoids harsh clipping. The `audio_quality` JSON line
+reports p10 noise, p80 voice level, SNR proxy, active/suppressed frame counts,
+quiet-section attenuation, digital gain, limiting count, and output peak.
+The listening expression is not shown until the microphone is open, and the
+first 120 ms of microphone data is retained as pre-roll rather than discarded,
+so speech beginning near the end of the cue is preserved.
+Duration, volume, and microphone gain are configurable under
+`Component config -> Elder companion firmware -> On-board audio verification`.
+This loopback proves only the local microphone/codec/amplifier/speaker path; it
+does not yet prove network speech recognition, Kimi, or speech synthesis.
+
+The board's two side keys are BOOT and PWR. Only BOOT triggers the repeat test;
+PWR controls board power and is not an application input.
+
+## UI / Waveshare BSP boundary
+
+The public UI facade is in `main/ui/ui.h`; hardware-specific rendering remains
+behind `main/ui/ui_board.h`. `components/elder_round_bsp` owns the 1.43C QSPI
+panel and LVGL adapter. The audio verification service is deliberately separate
+from `ui_board_play_sound`, so later TTS streaming can replace the temporary
+loopback without rewriting the expression renderer or JSON protocol.
 
 ## Source layout
 
@@ -156,6 +179,7 @@ main/
 ├── protocol/              bounded cJSON command/event codec
 ├── comms/usb_serial.[ch]  selectable USB Serial/JTAG or UART JSONL framing
 ├── comms/heartbeat.[ch]   periodic uptime report
+├── audio/audio_loopback.* ES7210 -> PSRAM -> ES8311 verification
 ├── input/buttons.[ch]     optional debounced GPIO inputs
-└── ui/                    UI facade, state/face modules, weak board adapter
+└── ui/                    UI facade and native round-display expressions
 ```

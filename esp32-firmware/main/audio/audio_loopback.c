@@ -1,0 +1,1134 @@
+#include "audio_loopback.h"
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "sdkconfig.h"
+#include "codec_board.h"
+#include "codec_init.h"
+#include "driver/gpio.h"
+#include "esp_check.h"
+#include "esp_codec_dev.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "app_state.h"
+#include "usb_serial.h"
+
+#define AUDIO_SAMPLE_RATE_HZ 16000
+#define CAPTURE_CHANNEL_COUNT 4
+#define CAPTURE_CHANNEL_MASK 0x000F
+#define PHYSICAL_MIC_COUNT 2
+#define PLAYBACK_CHANNEL_COUNT 2
+#define PLAYBACK_CHANNEL_MASK 0x0003
+#define AUDIO_BITS_PER_SAMPLE 16
+#define AUDIO_BYTES_PER_SAMPLE (AUDIO_BITS_PER_SAMPLE / 8)
+#define AUDIO_BOOT_BUTTON_GPIO GPIO_NUM_0
+#define AUDIO_CODEC_ENABLE_GPIO GPIO_NUM_18
+#define AUDIO_PA_ENABLE_GPIO GPIO_NUM_46
+#define AUDIO_TASK_STACK_SIZE (9 * 1024)
+#define AUDIO_TASK_PRIORITY 5
+#define AUDIO_TASK_CORE 0
+#define STARTUP_DELAY_MS 2500
+#define BUTTON_POLL_MS 20
+#define BUTTON_DEBOUNCE_MS 60
+#define CUE_DURATION_MS 120
+#define CUE_FREQUENCY_HZ 660
+#define CUE_AMPLITUDE 12000
+#define CUE_FRAMES_PER_CHUNK 128
+#define AUDIO_FORMAT_SWITCH_MS 30
+#define SPEAKER_MUTE_SETTLE_MS 20
+#define SPEAKER_OPEN_SETTLE_MS 30
+#define MICROPHONE_PREROLL_MS 120
+#define ES7210_INACTIVE_CHANNEL_MASK 0x000C
+#define ES7210_MIC1_GAIN_REG 0x43
+#define SPEECH_HPF_ALPHA_Q15 31506
+#define SPEECH_LPF_B0_Q14 4428
+#define SPEECH_LPF_B1_Q14 8856
+#define SPEECH_LPF_B2_Q14 4428
+#define SPEECH_LPF_A1_Q14 (-1508)
+#define SPEECH_LPF_A2_Q14 2836
+#define SPEECH_GAIN_Q12_ONE 4096
+#define SPEECH_MIN_GAIN_Q12 3072
+#define SPEECH_MAX_GAIN_Q12 8192
+#define SPEECH_TARGET_RMS 4000
+#define SPEECH_TARGET_PEAK 24000
+#define SPEECH_SOFT_KNEE_START 24000
+#define SPEECH_SOFT_KNEE_RANGE 6000
+#define SPEECH_CLIP_THRESHOLD 32500
+#define SPEECH_FADE_FRAMES (AUDIO_SAMPLE_RATE_HZ / 100)
+#define DENOISE_FRAME_SAMPLES (AUDIO_SAMPLE_RATE_HZ / 100)
+#define DENOISE_MAX_RECORD_SECONDS 8
+#define DENOISE_MAX_FRAMES \
+    ((DENOISE_MAX_RECORD_SECONDS * AUDIO_SAMPLE_RATE_HZ + \
+      DENOISE_FRAME_SAMPLES - 1) / DENOISE_FRAME_SAMPLES)
+#define DENOISE_HISTOGRAM_BINS 256
+#define DENOISE_HISTOGRAM_SHIFT 5
+#define DENOISE_GATE_FLOOR_Q15 4096
+#define DENOISE_SPEECH_FLOOR_Q15 24576
+#define DENOISE_FULL_GAIN_Q15 32768
+#define DENOISE_LOOKAHEAD_FRAMES 6
+#define DENOISE_HANGOVER_FRAMES 8
+#define DENOISE_RELEASE_DIVISOR 8
+#define DENOISE_SCRATCH_SLOT 1
+
+static const char *TAG = "audio_loopback";
+static TaskHandle_t s_task;
+/* Live 4ch telemetry on this board maps the two physical mics to slots 0/2. */
+static const uint8_t s_physical_mic_slot[PHYSICAL_MIC_COUNT] = {0, 2};
+
+typedef struct {
+    uint32_t raw_peak[CAPTURE_CHANNEL_COUNT];
+    int32_t dc_mean[CAPTURE_CHANNEL_COUNT];
+    uint32_t clipped[CAPTURE_CHANNEL_COUNT];
+    uint32_t filtered_peak[PHYSICAL_MIC_COUNT];
+    uint32_t filtered_rms[PHYSICAL_MIC_COUNT];
+    uint32_t noise_rms[PHYSICAL_MIC_COUNT];
+    uint32_t voice_rms[PHYSICAL_MIC_COUNT];
+    uint32_t snr_x100;
+    uint32_t active_frames;
+    uint32_t suppressed_frames;
+    uint32_t total_frames;
+    uint32_t average_gate_x100;
+    uint32_t quiet_input_rms;
+    uint32_t quiet_output_rms;
+    uint32_t output_peak;
+    uint32_t limited_count;
+    uint32_t gain_x100;
+    uint8_t selected_channel;
+} speech_quality_t;
+
+/*
+ * Waveshare's vendored codec_board 2.0.0 adds this board section, but the
+ * registry package with the same version does not. Parse the exact vendor
+ * section explicitly so runtime initialization cannot silently select an
+ * absent board name.
+ */
+static const char s_board_audio_config[] =
+    "i2c: {sda: 47, scl: 48}\n"
+    "i2s: {mclk: 38, bclk: 39, ws: 40, din: 42, dout: 41}\n"
+    "out: {codec: ES8311, pa: 46, pa_gain: 6, use_mclk: 1}\n"
+    "in: {codec: ES7210}\n";
+
+static void send_audio_status(const char *stage, int code)
+{
+    char line[128];
+    const int length = snprintf(line, sizeof(line),
+                                "{\"type\":\"audio_status\",\"stage\":\"%s\",\"code\":%d}",
+                                stage, code);
+    if (length <= 0 || length >= (int)sizeof(line)) {
+        return;
+    }
+    const esp_err_t result = usb_serial_send_line(line, (size_t)length);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "cannot report audio stage %s: %s",
+                 stage, esp_err_to_name(result));
+    }
+}
+
+static void send_audio_quality(const speech_quality_t *quality)
+{
+    char line[512];
+    const int length = snprintf(
+        line, sizeof(line),
+        "{\"type\":\"audio_quality\",\"format\":\"4ch16\","
+        "\"filter\":\"hpf100_lpf3800_expander\","
+        "\"peak\":[%u,%u,%u,%u],\"clip\":[%u,%u,%u,%u],"
+        "\"p10_noise\":[%u,%u],\"p80_voice\":[%u,%u],"
+        "\"selected_mic\":%u,\"snr_x100\":%u,"
+        "\"active_frames\":%u,\"suppressed_frames\":%u,"
+        "\"total_frames\":%u,\"avg_gate_x100\":%u,"
+        "\"quiet_rms\":[%u,%u],\"gain_x100\":%u,"
+        "\"limited\":%u,\"out_peak\":%u}",
+        (unsigned)quality->raw_peak[0],
+        (unsigned)quality->raw_peak[1],
+        (unsigned)quality->raw_peak[2],
+        (unsigned)quality->raw_peak[3],
+        (unsigned)quality->clipped[0],
+        (unsigned)quality->clipped[1],
+        (unsigned)quality->clipped[2],
+        (unsigned)quality->clipped[3],
+        (unsigned)quality->noise_rms[0],
+        (unsigned)quality->noise_rms[1],
+        (unsigned)quality->voice_rms[0],
+        (unsigned)quality->voice_rms[1],
+        (unsigned)(quality->selected_channel + 1),
+        (unsigned)quality->snr_x100,
+        (unsigned)quality->active_frames,
+        (unsigned)quality->suppressed_frames,
+        (unsigned)quality->total_frames,
+        (unsigned)quality->average_gate_x100,
+        (unsigned)quality->quiet_input_rms,
+        (unsigned)quality->quiet_output_rms,
+        (unsigned)quality->gain_x100,
+        (unsigned)quality->limited_count,
+        (unsigned)quality->output_peak);
+    if (length <= 0 || length >= (int)sizeof(line)) {
+        return;
+    }
+    const esp_err_t result = usb_serial_send_line(line, (size_t)length);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "cannot report audio quality: %s",
+                 esp_err_to_name(result));
+    }
+}
+
+static uint32_t sample_abs(int32_t sample)
+{
+    return sample < 0 ? (uint32_t)(-sample) : (uint32_t)sample;
+}
+
+static int16_t clamp_sample(int64_t sample, int32_t limit)
+{
+    if (sample > limit) {
+        return (int16_t)limit;
+    }
+    if (sample < -limit) {
+        return (int16_t)-limit;
+    }
+    return (int16_t)sample;
+}
+
+static uint32_t integer_sqrt_u64(uint64_t value)
+{
+    uint64_t remainder = value;
+    uint64_t result = 0;
+    uint64_t bit = UINT64_C(1) << 62;
+
+    while (bit > remainder) {
+        bit >>= 2;
+    }
+    while (bit != 0) {
+        if (remainder >= result + bit) {
+            remainder -= result + bit;
+            result = (result >> 1) + bit;
+        } else {
+            result >>= 1;
+        }
+        bit >>= 2;
+    }
+    return (uint32_t)result;
+}
+
+typedef struct {
+    int32_t input_1;
+    int32_t input_2;
+    int32_t output_1;
+    int32_t output_2;
+} speech_lpf_state_t;
+
+static int32_t speech_lowpass(speech_lpf_state_t *state, int32_t input)
+{
+    const int64_t accumulator =
+        (int64_t)SPEECH_LPF_B0_Q14 * input +
+        (int64_t)SPEECH_LPF_B1_Q14 * state->input_1 +
+        (int64_t)SPEECH_LPF_B2_Q14 * state->input_2 -
+        (int64_t)SPEECH_LPF_A1_Q14 * state->output_1 -
+        (int64_t)SPEECH_LPF_A2_Q14 * state->output_2;
+    const int32_t output = (int32_t)((accumulator + (1 << 13)) >> 14);
+    state->input_2 = state->input_1;
+    state->input_1 = input;
+    state->output_2 = state->output_1;
+    state->output_1 = output;
+    return output;
+}
+
+static uint32_t histogram_percentile(
+    const uint16_t histogram[DENOISE_HISTOGRAM_BINS],
+    uint32_t sample_count,
+    uint32_t percentile)
+{
+    if (sample_count == 0) {
+        return 0;
+    }
+    uint32_t target = (sample_count * percentile + 99U) / 100U;
+    if (target == 0) {
+        target = 1;
+    }
+    uint32_t cumulative = 0;
+    for (uint32_t bin = 0; bin < DENOISE_HISTOGRAM_BINS; ++bin) {
+        cumulative += histogram[bin];
+        if (cumulative >= target) {
+            return (bin << DENOISE_HISTOGRAM_SHIFT) +
+                   (1U << (DENOISE_HISTOGRAM_SHIFT - 1));
+        }
+    }
+    return (DENOISE_HISTOGRAM_BINS - 1) << DENOISE_HISTOGRAM_SHIFT;
+}
+
+static void analyze_microphones(const int16_t *samples,
+                                size_t frame_count,
+                                speech_quality_t *quality)
+{
+    uint16_t histogram[PHYSICAL_MIC_COUNT][DENOISE_HISTOGRAM_BINS] = {{0}};
+    uint64_t total_energy[PHYSICAL_MIC_COUNT] = {0};
+    uint32_t block_count = 0;
+
+    for (size_t block_start = 0; block_start < frame_count;
+         block_start += DENOISE_FRAME_SAMPLES) {
+        size_t block_frames = frame_count - block_start;
+        if (block_frames > DENOISE_FRAME_SAMPLES) {
+            block_frames = DENOISE_FRAME_SAMPLES;
+        }
+        ++block_count;
+
+        for (size_t microphone = 0; microphone < PHYSICAL_MIC_COUNT;
+             ++microphone) {
+            uint64_t block_energy = 0;
+            const size_t slot = s_physical_mic_slot[microphone];
+            for (size_t offset = 0; offset < block_frames; ++offset) {
+                const int32_t sample =
+                    samples[(block_start + offset) * CAPTURE_CHANNEL_COUNT +
+                            slot];
+                const uint32_t magnitude = sample_abs(sample);
+                if (magnitude > quality->filtered_peak[microphone]) {
+                    quality->filtered_peak[microphone] = magnitude;
+                }
+                const uint64_t squared =
+                    (uint64_t)((int64_t)sample * sample);
+                block_energy += squared;
+                total_energy[microphone] += squared;
+            }
+            const uint32_t rms =
+                integer_sqrt_u64(block_energy / block_frames);
+            uint32_t bin = rms >> DENOISE_HISTOGRAM_SHIFT;
+            if (bin >= DENOISE_HISTOGRAM_BINS) {
+                bin = DENOISE_HISTOGRAM_BINS - 1;
+            }
+            histogram[microphone][bin]++;
+        }
+    }
+
+    for (size_t microphone = 0; microphone < PHYSICAL_MIC_COUNT;
+         ++microphone) {
+        if (frame_count != 0) {
+            quality->filtered_rms[microphone] =
+                integer_sqrt_u64(total_energy[microphone] / frame_count);
+        }
+        quality->noise_rms[microphone] = histogram_percentile(
+            histogram[microphone], block_count, 10);
+        quality->voice_rms[microphone] = histogram_percentile(
+            histogram[microphone], block_count, 80);
+    }
+}
+
+static uint32_t denoise_target_gain_q15(uint32_t rms, uint32_t noise_rms)
+{
+    const uint64_t signal_power = (uint64_t)rms * rms;
+    const uint64_t noise_power = (uint64_t)noise_rms * noise_rms;
+    if (signal_power == 0 || signal_power * 2U <= noise_power * 3U) {
+        return DENOISE_GATE_FLOOR_Q15;
+    }
+
+    const uint64_t reduction =
+        ((noise_power * 3U) << 14) / signal_power;
+    if (reduction >= DENOISE_FULL_GAIN_Q15 - DENOISE_GATE_FLOOR_Q15) {
+        return DENOISE_GATE_FLOOR_Q15;
+    }
+    return DENOISE_FULL_GAIN_Q15 - (uint32_t)reduction;
+}
+
+static int16_t soft_limit_sample(int64_t sample, speech_quality_t *quality)
+{
+    const bool negative = sample < 0;
+    uint32_t magnitude = negative ? (uint32_t)(-sample) : (uint32_t)sample;
+    if (magnitude > SPEECH_SOFT_KNEE_START) {
+        const uint32_t excess = magnitude - SPEECH_SOFT_KNEE_START;
+        magnitude = SPEECH_SOFT_KNEE_START +
+                    (excess * SPEECH_SOFT_KNEE_RANGE) /
+                        (excess + SPEECH_SOFT_KNEE_RANGE);
+        quality->limited_count++;
+    }
+    if (magnitude > INT16_MAX) {
+        magnitude = INT16_MAX;
+    }
+    return negative ? -(int16_t)magnitude : (int16_t)magnitude;
+}
+
+static size_t process_speech_recording(int16_t *samples,
+                                       size_t frame_count,
+                                       speech_quality_t *quality)
+{
+    int32_t previous_input[PHYSICAL_MIC_COUNT] = {0};
+    int32_t previous_output[PHYSICAL_MIC_COUNT] = {0};
+    speech_lpf_state_t lowpass_state[PHYSICAL_MIC_COUNT] = {0};
+    int64_t raw_sum[CAPTURE_CHANNEL_COUNT] = {0};
+
+    for (size_t frame = 0; frame < frame_count; ++frame) {
+        for (size_t channel = 0; channel < CAPTURE_CHANNEL_COUNT; ++channel) {
+            const size_t index = frame * CAPTURE_CHANNEL_COUNT + channel;
+            const int32_t input = samples[index];
+            const uint32_t magnitude = sample_abs(input);
+            raw_sum[channel] += input;
+            if (magnitude > quality->raw_peak[channel]) {
+                quality->raw_peak[channel] = magnitude;
+            }
+            if (magnitude >= SPEECH_CLIP_THRESHOLD) {
+                quality->clipped[channel]++;
+            }
+        }
+
+        for (size_t microphone = 0; microphone < PHYSICAL_MIC_COUNT;
+             ++microphone) {
+            const size_t index = frame * CAPTURE_CHANNEL_COUNT +
+                                 s_physical_mic_slot[microphone];
+            const int32_t input = samples[index];
+            const int64_t filtered =
+                (int64_t)input - previous_input[microphone] +
+                (((int64_t)SPEECH_HPF_ALPHA_Q15 *
+                  previous_output[microphone]) >> 15);
+            previous_input[microphone] = input;
+            previous_output[microphone] = (int32_t)filtered;
+            const int32_t speech_band =
+                speech_lowpass(&lowpass_state[microphone],
+                               (int32_t)filtered);
+            samples[index] = clamp_sample(speech_band, INT16_MAX);
+        }
+    }
+    if (frame_count != 0) {
+        for (size_t channel = 0; channel < CAPTURE_CHANNEL_COUNT; ++channel) {
+            quality->dc_mean[channel] =
+                (int32_t)(raw_sum[channel] / (int64_t)frame_count);
+        }
+    }
+
+    analyze_microphones(samples, frame_count, quality);
+
+    const uint32_t meaningful_clip_count =
+        frame_count / 1000 > 4 ? (uint32_t)(frame_count / 1000) : 4;
+    const uint32_t mic1_clipped =
+        quality->clipped[s_physical_mic_slot[0]];
+    const uint32_t mic2_clipped =
+        quality->clipped[s_physical_mic_slot[1]];
+    if (mic1_clipped > meaningful_clip_count &&
+        mic1_clipped > mic2_clipped * 2 + 4) {
+        quality->selected_channel = 1;
+    } else if (mic2_clipped > meaningful_clip_count &&
+               mic2_clipped > mic1_clipped * 2 + 4) {
+        quality->selected_channel = 0;
+    } else {
+        const uint64_t mic1_score =
+            (uint64_t)quality->voice_rms[0] *
+            (quality->noise_rms[1] + 32U);
+        const uint64_t mic2_score =
+            (uint64_t)quality->voice_rms[1] *
+            (quality->noise_rms[0] + 32U);
+        /* Keep MIC1 unless MIC2's full-recording SNR is at least 20% better. */
+        if (mic2_score * 100U > mic1_score * 120U) {
+            quality->selected_channel = 1;
+        }
+    }
+
+    const uint32_t selected = quality->selected_channel;
+    const size_t selected_slot = s_physical_mic_slot[selected];
+    uint32_t noise_rms = quality->noise_rms[selected];
+    if (noise_rms < 32) {
+        noise_rms = 32;
+    }
+    quality->snr_x100 =
+        (quality->voice_rms[selected] * 100U) / noise_rms;
+
+    if (frame_count == 0) {
+        return 0;
+    }
+    const size_t denoise_frames =
+        (frame_count + DENOISE_FRAME_SAMPLES - 1) /
+        DENOISE_FRAME_SAMPLES;
+    if (denoise_frames > DENOISE_MAX_FRAMES) {
+        ESP_LOGE(TAG, "recording exceeds denoise frame capacity");
+        return 0;
+    }
+
+    uint16_t frame_rms[DENOISE_MAX_FRAMES] = {0};
+    bool quiet_frame[DENOISE_MAX_FRAMES] = {0};
+    for (size_t block = 0; block < denoise_frames; ++block) {
+        const size_t block_start = block * DENOISE_FRAME_SAMPLES;
+        size_t block_samples = frame_count - block_start;
+        if (block_samples > DENOISE_FRAME_SAMPLES) {
+            block_samples = DENOISE_FRAME_SAMPLES;
+        }
+        uint64_t energy = 0;
+        for (size_t offset = 0; offset < block_samples; ++offset) {
+            const size_t frame = block_start + offset;
+            const int16_t sample =
+                samples[frame * CAPTURE_CHANNEL_COUNT + selected_slot];
+            samples[frame * CAPTURE_CHANNEL_COUNT + DENOISE_SCRATCH_SLOT] =
+                sample;
+            energy += (uint64_t)((int64_t)sample * sample);
+        }
+        frame_rms[block] =
+            (uint16_t)integer_sqrt_u64(energy / block_samples);
+    }
+
+    const uint32_t vad_threshold =
+        noise_rms * 2U > noise_rms + 64U ?
+            noise_rms * 2U : noise_rms + 64U;
+    uint32_t current_gate_q15 = DENOISE_FULL_GAIN_Q15;
+    uint32_t hangover = 0;
+    uint64_t gate_sum_q15 = 0;
+    uint64_t active_energy = 0;
+    uint64_t active_samples = 0;
+    uint64_t quiet_input_energy = 0;
+    uint64_t quiet_input_samples = 0;
+    uint32_t active_peak = 0;
+
+    for (size_t block = 0; block < denoise_frames; ++block) {
+        const bool voice_active = frame_rms[block] >= vad_threshold;
+        bool upcoming_voice_active = false;
+        for (size_t lookahead = 1;
+             lookahead <= DENOISE_LOOKAHEAD_FRAMES &&
+             block + lookahead < denoise_frames;
+             ++lookahead) {
+            if (frame_rms[block + lookahead] >= vad_threshold) {
+                upcoming_voice_active = true;
+                break;
+            }
+        }
+        uint32_t target_gate_q15 =
+            denoise_target_gain_q15(frame_rms[block], noise_rms);
+
+        if (voice_active) {
+            quality->active_frames++;
+            hangover = DENOISE_HANGOVER_FRAMES;
+        }
+        const bool speech_protected =
+            voice_active || upcoming_voice_active || hangover > 0;
+        quiet_frame[block] = !speech_protected;
+        if (speech_protected) {
+            if (target_gate_q15 < DENOISE_SPEECH_FLOOR_Q15) {
+                target_gate_q15 = DENOISE_SPEECH_FLOOR_Q15;
+            }
+        }
+        if (!voice_active && hangover > 0) {
+            --hangover;
+        }
+
+        if (block == 0) {
+            current_gate_q15 = target_gate_q15;
+        }
+        uint32_t next_gate_q15 = target_gate_q15;
+        if (target_gate_q15 < current_gate_q15) {
+            next_gate_q15 = current_gate_q15 -
+                (current_gate_q15 - target_gate_q15 +
+                 DENOISE_RELEASE_DIVISOR - 1) /
+                    DENOISE_RELEASE_DIVISOR;
+        }
+        if (next_gate_q15 < (DENOISE_FULL_GAIN_Q15 * 9U) / 10U) {
+            quality->suppressed_frames++;
+        }
+
+        const size_t block_start = block * DENOISE_FRAME_SAMPLES;
+        size_t block_samples = frame_count - block_start;
+        if (block_samples > DENOISE_FRAME_SAMPLES) {
+            block_samples = DENOISE_FRAME_SAMPLES;
+        }
+        for (size_t offset = 0; offset < block_samples; ++offset) {
+            const size_t frame = block_start + offset;
+            const int32_t interpolated_gate =
+                (int32_t)current_gate_q15 +
+                ((int32_t)next_gate_q15 - (int32_t)current_gate_q15) *
+                    (int32_t)(offset + 1) / (int32_t)block_samples;
+            const size_t scratch_index =
+                frame * CAPTURE_CHANNEL_COUNT + DENOISE_SCRATCH_SLOT;
+            const int32_t input = samples[scratch_index];
+            const int32_t output =
+                (int32_t)(((int64_t)input * interpolated_gate) >> 15);
+            samples[scratch_index] = clamp_sample(output, INT16_MAX);
+
+            const uint64_t input_squared =
+                (uint64_t)((int64_t)input * input);
+            const uint64_t output_squared =
+                (uint64_t)((int64_t)output * output);
+            if (voice_active) {
+                active_energy += output_squared;
+                active_samples++;
+                const uint32_t magnitude = sample_abs(output);
+                if (magnitude > active_peak) {
+                    active_peak = magnitude;
+                }
+            } else if (quiet_frame[block]) {
+                quiet_input_energy += input_squared;
+                quiet_input_samples++;
+            }
+        }
+        gate_sum_q15 +=
+            ((uint64_t)current_gate_q15 + next_gate_q15) / 2U;
+        current_gate_q15 = next_gate_q15;
+    }
+
+    quality->total_frames = (uint32_t)denoise_frames;
+    quality->average_gate_x100 =
+        (uint32_t)((gate_sum_q15 * 100U) /
+                   (denoise_frames * DENOISE_FULL_GAIN_Q15));
+    if (quiet_input_samples != 0) {
+        quality->quiet_input_rms =
+            integer_sqrt_u64(quiet_input_energy / quiet_input_samples);
+    }
+
+    const uint32_t active_rms = active_samples == 0 ? 0 :
+        integer_sqrt_u64(active_energy / active_samples);
+    uint32_t gain_q12 = SPEECH_GAIN_Q12_ONE;
+    if (quality->active_frames >= 3 && active_rms > 0 && active_peak > 0) {
+        const uint32_t rms_gain =
+            (uint32_t)(((uint64_t)SPEECH_TARGET_RMS << 12) / active_rms);
+        const uint32_t peak_gain =
+            (uint32_t)(((uint64_t)SPEECH_TARGET_PEAK << 12) / active_peak);
+        gain_q12 = rms_gain < peak_gain ? rms_gain : peak_gain;
+        if (gain_q12 < SPEECH_MIN_GAIN_Q12) {
+            gain_q12 = SPEECH_MIN_GAIN_Q12;
+        }
+        if (gain_q12 > SPEECH_MAX_GAIN_Q12) {
+            gain_q12 = SPEECH_MAX_GAIN_Q12;
+        }
+    }
+    quality->gain_x100 =
+        (gain_q12 * 100 + SPEECH_GAIN_Q12_ONE / 2) /
+        SPEECH_GAIN_Q12_ONE;
+
+    uint64_t quiet_output_energy = 0;
+    uint64_t quiet_output_samples = 0;
+    uint32_t current_agc_gain_q12 =
+        quiet_frame[0] ? SPEECH_GAIN_Q12_ONE : gain_q12;
+    for (size_t block = 0; block < denoise_frames; ++block) {
+        const uint32_t target_agc_gain_q12 =
+            quiet_frame[block] ? SPEECH_GAIN_Q12_ONE : gain_q12;
+        const size_t block_start = block * DENOISE_FRAME_SAMPLES;
+        size_t block_samples = frame_count - block_start;
+        if (block_samples > DENOISE_FRAME_SAMPLES) {
+            block_samples = DENOISE_FRAME_SAMPLES;
+        }
+
+        for (size_t offset = 0; offset < block_samples; ++offset) {
+            const size_t frame = block_start + offset;
+            const int32_t interpolated_agc_gain =
+                (int32_t)current_agc_gain_q12 +
+                ((int32_t)target_agc_gain_q12 -
+                 (int32_t)current_agc_gain_q12) *
+                    (int32_t)(offset + 1) / (int32_t)block_samples;
+            int64_t output =
+                ((int64_t)samples[frame * CAPTURE_CHANNEL_COUNT +
+                                 DENOISE_SCRATCH_SLOT] *
+                 interpolated_agc_gain) >> 12;
+            if (frame < SPEECH_FADE_FRAMES) {
+                output = output * (int64_t)(frame + 1) /
+                         SPEECH_FADE_FRAMES;
+            }
+            const size_t frames_remaining = frame_count - frame;
+            if (frames_remaining < SPEECH_FADE_FRAMES) {
+                output = output * (int64_t)frames_remaining /
+                         SPEECH_FADE_FRAMES;
+            }
+            const int16_t processed = soft_limit_sample(output, quality);
+            const uint32_t magnitude = sample_abs(processed);
+            if (magnitude > quality->output_peak) {
+                quality->output_peak = magnitude;
+            }
+            if (quiet_frame[block]) {
+                quiet_output_energy +=
+                    (uint64_t)((int64_t)processed * processed);
+                quiet_output_samples++;
+            }
+            samples[frame * PLAYBACK_CHANNEL_COUNT] = processed;
+            samples[frame * PLAYBACK_CHANNEL_COUNT + 1] = processed;
+        }
+        current_agc_gain_q12 = target_agc_gain_q12;
+    }
+    if (quiet_output_samples != 0) {
+        quality->quiet_output_rms =
+            integer_sqrt_u64(quiet_output_energy / quiet_output_samples);
+    }
+    return frame_count * PLAYBACK_CHANNEL_COUNT * AUDIO_BYTES_PER_SAMPLE;
+}
+
+static bool codec_call_ok(int result, const char *operation)
+{
+    if (result == 0) {
+        return true;
+    }
+    send_audio_status(operation, result);
+    ESP_LOGE(TAG, "%s failed: codec error %d", operation, result);
+    return false;
+}
+
+static uint8_t es7210_gain_code_for_db(int db)
+{
+    if (db <= 2) {
+        return 0;
+    }
+    if (db <= 32) {
+        return (uint8_t)((2 * db + 1) / 6);
+    }
+    if (db == 33) {
+        return 10;
+    }
+    if (db <= 35) {
+        return 12;
+    }
+    if (db == 36) {
+        return 13;
+    }
+    return 14;
+}
+
+static bool verify_microphone_gain_registers(
+    esp_codec_dev_handle_t microphone)
+{
+    int registers[4] = {0};
+    bool read_ok = true;
+    for (int index = 0; index < 4; ++index) {
+        const int result = esp_codec_dev_read_reg(
+            microphone, ES7210_MIC1_GAIN_REG + index,
+            &registers[index]);
+        if (result != 0) {
+            read_ok = false;
+        }
+    }
+
+    char line[192];
+    const int length = snprintf(
+        line, sizeof(line),
+        "{\"type\":\"audio_codec\",\"mic_gain_db\":%d,"
+        "\"gain_regs\":[%d,%d,%d,%d],\"read_ok\":%s}",
+        CONFIG_ELDER_AUDIO_MIC_GAIN_DB,
+        registers[0], registers[1], registers[2], registers[3],
+        read_ok ? "true" : "false");
+    if (length > 0 && length < (int)sizeof(line)) {
+        usb_serial_send_line(line, (size_t)length);
+    }
+
+    const int expected_active = 0x10 |
+        es7210_gain_code_for_db(CONFIG_ELDER_AUDIO_MIC_GAIN_DB);
+    const bool registers_match =
+        (registers[0] & 0x1F) == expected_active &&
+        (registers[1] & 0x1F) == expected_active &&
+        (registers[2] & 0x1F) == 0x10 &&
+        (registers[3] & 0x1F) == 0x10;
+    if (!read_ok || !registers_match) {
+        send_audio_status("microphone_gain_verify_failed", -1);
+        ESP_LOGE(TAG, "ES7210 gain register verification failed");
+        return false;
+    }
+    return true;
+}
+
+static bool set_state(app_state_t state)
+{
+    const esp_err_t result = app_state_set(state);
+    if (result == ESP_OK) {
+        return true;
+    }
+    ESP_LOGE(TAG, "cannot show %s state: %s",
+             app_state_to_string(state), esp_err_to_name(result));
+    return false;
+}
+
+static bool open_speaker(esp_codec_dev_handle_t speaker)
+{
+    esp_codec_dev_sample_info_t sample_info = {
+        .sample_rate = AUDIO_SAMPLE_RATE_HZ,
+        .channel = PLAYBACK_CHANNEL_COUNT,
+        .channel_mask = PLAYBACK_CHANNEL_MASK,
+        .bits_per_sample = AUDIO_BITS_PER_SAMPLE,
+    };
+    int result = esp_codec_dev_open(speaker, &sample_info);
+    send_audio_status("speaker_open_2ch16", result);
+    if (!codec_call_ok(result, "speaker_open_failed")) {
+        return false;
+    }
+
+    result = gpio_set_level(AUDIO_PA_ENABLE_GPIO, 1);
+    send_audio_status("pa_enable", result);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "cannot enable speaker power amplifier: %s",
+                 esp_err_to_name(result));
+        esp_codec_dev_close(speaker);
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(SPEAKER_OPEN_SETTLE_MS));
+
+    result = esp_codec_dev_set_out_vol(speaker,
+                                       CONFIG_ELDER_AUDIO_SPEAKER_VOLUME);
+    send_audio_status("speaker_volume", result);
+    if (!codec_call_ok(result, "speaker_volume_failed")) {
+        esp_codec_dev_close(speaker);
+        return false;
+    }
+
+    result = esp_codec_dev_set_out_mute(speaker, false);
+    send_audio_status("speaker_unmuted", result);
+    if (!codec_call_ok(result, "speaker_unmute_failed")) {
+        esp_codec_dev_close(speaker);
+        return false;
+    }
+    return true;
+}
+
+static bool close_speaker(esp_codec_dev_handle_t speaker)
+{
+    int result = esp_codec_dev_set_out_mute(speaker, true);
+    send_audio_status("speaker_muted", result);
+    const bool mute_ok = codec_call_ok(result, "speaker_mute_failed");
+    if (mute_ok) {
+        vTaskDelay(pdMS_TO_TICKS(SPEAKER_MUTE_SETTLE_MS));
+    }
+
+    result = esp_codec_dev_close(speaker);
+    send_audio_status("speaker_closed", result);
+    const bool close_ok = codec_call_ok(result, "speaker_close_failed");
+
+    const esp_err_t pa_result = gpio_set_level(AUDIO_PA_ENABLE_GPIO, 0);
+    send_audio_status("pa_disable", pa_result);
+    if (pa_result != ESP_OK) {
+        ESP_LOGE(TAG, "cannot disable speaker power amplifier: %s",
+                 esp_err_to_name(pa_result));
+    }
+    return mute_ok && close_ok && pa_result == ESP_OK;
+}
+
+static bool open_microphone(esp_codec_dev_handle_t microphone)
+{
+    esp_codec_dev_sample_info_t sample_info = {
+        .sample_rate = AUDIO_SAMPLE_RATE_HZ,
+        .channel = CAPTURE_CHANNEL_COUNT,
+        .channel_mask = CAPTURE_CHANNEL_MASK,
+        .bits_per_sample = AUDIO_BITS_PER_SAMPLE,
+    };
+    int result = esp_codec_dev_open(microphone, &sample_info);
+    send_audio_status("microphone_open_4ch16", result);
+    if (!codec_call_ok(result, "microphone_open_failed")) {
+        esp_codec_dev_close(microphone);
+        return false;
+    }
+
+    result = esp_codec_dev_set_in_gain(microphone,
+                                       CONFIG_ELDER_AUDIO_MIC_GAIN_DB);
+    send_audio_status("microphone_gain", result);
+    if (!codec_call_ok(result, "microphone_gain_failed")) {
+        esp_codec_dev_close(microphone);
+        return false;
+    }
+
+    result = esp_codec_dev_set_in_channel_gain(
+        microphone, ES7210_INACTIVE_CHANNEL_MASK, 0.0f);
+    send_audio_status("microphone_inactive_gain", result);
+    if (!codec_call_ok(result, "microphone_inactive_gain_failed") ||
+        !verify_microphone_gain_registers(microphone)) {
+        esp_codec_dev_close(microphone);
+        return false;
+    }
+    return true;
+}
+
+static bool close_microphone(esp_codec_dev_handle_t microphone)
+{
+    const int result = esp_codec_dev_close(microphone);
+    send_audio_status("microphone_closed", result);
+    return codec_call_ok(result, "microphone_close_failed");
+}
+
+static void recover_speaker_state(esp_codec_dev_handle_t speaker,
+                                  esp_codec_dev_handle_t microphone)
+{
+    esp_codec_dev_close(microphone);
+    esp_codec_dev_close(speaker);
+    gpio_set_level(AUDIO_PA_ENABLE_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(AUDIO_FORMAT_SWITCH_MS));
+    const bool recovered = open_speaker(speaker);
+    send_audio_status("speaker_recovery", recovered ? 0 : -1);
+}
+
+static bool play_start_cue(esp_codec_dev_handle_t speaker)
+{
+    int16_t samples[CUE_FRAMES_PER_CHUNK * PLAYBACK_CHANNEL_COUNT];
+    const int total_frames = (AUDIO_SAMPLE_RATE_HZ * CUE_DURATION_MS) / 1000;
+    uint32_t phase = 0;
+    int generated = 0;
+
+    while (generated < total_frames) {
+        int chunk_frames = total_frames - generated;
+        if (chunk_frames > CUE_FRAMES_PER_CHUNK) {
+            chunk_frames = CUE_FRAMES_PER_CHUNK;
+        }
+
+        for (int frame = 0; frame < chunk_frames; ++frame) {
+            const uint32_t cycle = phase % AUDIO_SAMPLE_RATE_HZ;
+            int32_t value;
+            if (cycle < (AUDIO_SAMPLE_RATE_HZ / 2)) {
+                value = -CUE_AMPLITUDE +
+                        (4 * CUE_AMPLITUDE * (int32_t)cycle) /
+                            AUDIO_SAMPLE_RATE_HZ;
+            } else {
+                value = 3 * CUE_AMPLITUDE -
+                        (4 * CUE_AMPLITUDE * (int32_t)cycle) /
+                            AUDIO_SAMPLE_RATE_HZ;
+            }
+            phase += CUE_FREQUENCY_HZ;
+
+            samples[frame * 2] = (int16_t)value;
+            samples[frame * 2 + 1] = (int16_t)value;
+        }
+
+        if (!codec_call_ok(
+                esp_codec_dev_write(speaker, samples,
+                                    chunk_frames * PLAYBACK_CHANNEL_COUNT *
+                                        AUDIO_BYTES_PER_SAMPLE),
+                "play start cue")) {
+            return false;
+        }
+        generated += chunk_frames;
+    }
+    return true;
+}
+
+static bool run_loopback(esp_codec_dev_handle_t speaker,
+                         esp_codec_dev_handle_t microphone,
+                         uint8_t *recording,
+                         size_t recording_bytes)
+{
+    ESP_LOGI(TAG, "LISTEN now: recording %d second(s)",
+             CONFIG_ELDER_AUDIO_RECORD_SECONDS);
+    send_audio_status("cue_started", 0);
+
+    if (!play_start_cue(speaker)) {
+        recover_speaker_state(speaker, microphone);
+        return false;
+    }
+    send_audio_status("cue_completed", 0);
+
+    if (!close_speaker(speaker)) {
+        recover_speaker_state(speaker, microphone);
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(AUDIO_FORMAT_SWITCH_MS));
+
+    if (!open_microphone(microphone)) {
+        recover_speaker_state(speaker, microphone);
+        return false;
+    }
+
+    /*
+     * Capture the codec's first 120 ms immediately, before UI or USB work can
+     * delay the RX read. Keep it as pre-roll instead of discarding it, so
+     * speech that starts on the cue tail is not overwritten by the main read.
+     * The listening expression is then the reliable "speak now" signal.
+     */
+    const size_t preroll_bytes =
+        (size_t)AUDIO_SAMPLE_RATE_HZ * CAPTURE_CHANNEL_COUNT *
+        AUDIO_BYTES_PER_SAMPLE * MICROPHONE_PREROLL_MS / 1000;
+    const int preroll_result =
+        esp_codec_dev_read(microphone, recording, (int)preroll_bytes);
+    send_audio_status("microphone_preroll_captured", preroll_result);
+    if (!codec_call_ok(preroll_result, "microphone_preroll_failed")) {
+        recover_speaker_state(speaker, microphone);
+        return false;
+    }
+
+    send_audio_status("recording_started", 0);
+    set_state(APP_STATE_LISTENING);
+    const int read_result =
+        esp_codec_dev_read(microphone, recording + preroll_bytes,
+                           (int)(recording_bytes - preroll_bytes));
+    const bool read_ok = codec_call_ok(read_result, "recording_failed");
+    const bool microphone_closed = close_microphone(microphone);
+    if (!read_ok || !microphone_closed) {
+        recover_speaker_state(speaker, microphone);
+        return false;
+    }
+    send_audio_status("recording_completed", 0);
+
+    speech_quality_t quality = {0};
+    const size_t playback_bytes = process_speech_recording(
+        (int16_t *)recording,
+        recording_bytes /
+            (CAPTURE_CHANNEL_COUNT * AUDIO_BYTES_PER_SAMPLE),
+        &quality);
+    send_audio_quality(&quality);
+    send_audio_status("speech_processed", 0);
+
+    vTaskDelay(pdMS_TO_TICKS(AUDIO_FORMAT_SWITCH_MS));
+    if (!open_speaker(speaker)) {
+        recover_speaker_state(speaker, microphone);
+        return false;
+    }
+
+    ESP_LOGI(TAG,
+             "SPEAKING now: replaying %u bytes converted from %u-byte 4-channel capture",
+             (unsigned)playback_bytes, (unsigned)recording_bytes);
+    send_audio_status("playback_started", 0);
+    set_state(APP_STATE_SPEAKING);
+    vTaskDelay(pdMS_TO_TICKS(120));
+    if (!codec_call_ok(
+            esp_codec_dev_write(speaker, recording, (int)playback_bytes),
+            "playback_failed")) {
+        recover_speaker_state(speaker, microphone);
+        return false;
+    }
+    send_audio_status("playback_completed", 0);
+
+    ESP_LOGI(TAG, "record/replay cycle completed; press BOOT to repeat");
+    set_state(APP_STATE_COMFORT);
+    vTaskDelay(pdMS_TO_TICKS(900));
+    set_state(APP_STATE_IDLE);
+    return true;
+}
+
+static void wait_for_boot_press(void)
+{
+    for (;;) {
+        if (gpio_get_level(AUDIO_BOOT_BUTTON_GPIO) != 0) {
+            vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
+            continue;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
+        if (gpio_get_level(AUDIO_BOOT_BUTTON_GPIO) != 0) {
+            continue;
+        }
+
+        while (gpio_get_level(AUDIO_BOOT_BUTTON_GPIO) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
+        }
+        vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
+        send_audio_status("boot_button", 0);
+        return;
+    }
+}
+
+static bool initialize_codecs(esp_codec_dev_handle_t *speaker,
+                              esp_codec_dev_handle_t *microphone)
+{
+    const gpio_config_t codec_power_config = {
+        .pin_bit_mask = UINT64_C(1) << AUDIO_CODEC_ENABLE_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t gpio_result = gpio_config(&codec_power_config);
+    if (gpio_result == ESP_OK) {
+        gpio_result = gpio_set_level(AUDIO_CODEC_ENABLE_GPIO, 1);
+    }
+    send_audio_status("codec_power", gpio_result);
+    if (gpio_result != ESP_OK) {
+        ESP_LOGE(TAG, "cannot enable codec 3.3 V rail: %s",
+                 esp_err_to_name(gpio_result));
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    const int board_result = codec_board_parse_all_config(s_board_audio_config);
+    send_audio_status("board_config", board_result);
+    if (board_result != 0) {
+        ESP_LOGE(TAG, "cannot parse Waveshare 1.43C audio board configuration");
+        return false;
+    }
+
+    codec_init_cfg_t codec_config = {
+        .in_mode = CODEC_I2S_MODE_TDM,
+        .out_mode = CODEC_I2S_MODE_TDM,
+        .in_use_tdm = false,
+        .reuse_dev = false,
+    };
+    const int init_result = init_codec(&codec_config);
+    send_audio_status("codec_init", init_result);
+    if (init_result != 0) {
+        ESP_LOGE(TAG, "cannot initialize ES7210/ES8311 codec board");
+        return false;
+    }
+
+    *speaker = get_playback_handle();
+    *microphone = get_record_handle();
+    if (*speaker == NULL || *microphone == NULL) {
+        send_audio_status("codec_handles", -1);
+        ESP_LOGE(TAG, "codec board returned a null audio handle");
+        return false;
+    }
+    send_audio_status("codec_handles", 0);
+
+    /*
+     * Only one direction is open at a time. The shared I2S bus can therefore
+     * use 2ch16 for ES8311 playback and the ES7210's native 4ch16 TDM frame for
+     * capture without either driver stretching the other direction's slots.
+     */
+    return open_speaker(*speaker);
+}
+
+static void audio_task(void *argument)
+{
+    (void)argument;
+    send_audio_status("task_started", 0);
+    const size_t recording_bytes =
+        (size_t)AUDIO_SAMPLE_RATE_HZ * CAPTURE_CHANNEL_COUNT *
+        AUDIO_BYTES_PER_SAMPLE * CONFIG_ELDER_AUDIO_RECORD_SECONDS;
+    uint8_t *recording = heap_caps_malloc(
+        recording_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (recording == NULL) {
+        send_audio_status("buffer_allocation", -1);
+        ESP_LOGE(TAG, "cannot allocate %u-byte PSRAM recording buffer",
+                 (unsigned)recording_bytes);
+        set_state(APP_STATE_CONFUSED);
+        s_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    send_audio_status("buffer_allocation", 0);
+
+    esp_codec_dev_handle_t speaker = NULL;
+    esp_codec_dev_handle_t microphone = NULL;
+    if (!initialize_codecs(&speaker, &microphone)) {
+        heap_caps_free(recording);
+        set_state(APP_STATE_CONFUSED);
+        s_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "on-board audio ready: 16 kHz 4ch16 TDM capture -> 2ch16 playback, volume=%d, mic gain=%d dB",
+             CONFIG_ELDER_AUDIO_SPEAKER_VOLUME,
+             CONFIG_ELDER_AUDIO_MIC_GAIN_DB);
+    send_audio_status("ready", 0);
+    ESP_LOGI(TAG, "automatic microphone/speaker test starts in %d ms",
+             STARTUP_DELAY_MS);
+    vTaskDelay(pdMS_TO_TICKS(STARTUP_DELAY_MS));
+
+    for (;;) {
+        if (!run_loopback(speaker, microphone, recording, recording_bytes)) {
+            send_audio_status("cycle_failed", -1);
+            set_state(APP_STATE_CONFUSED);
+            vTaskDelay(pdMS_TO_TICKS(1200));
+            set_state(APP_STATE_IDLE);
+        }
+        wait_for_boot_press();
+    }
+}
+
+esp_err_t audio_loopback_start(void)
+{
+    if (s_task != NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const gpio_config_t button_config = {
+        .pin_bit_mask = UINT64_C(1) << AUDIO_BOOT_BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&button_config), TAG,
+                        "configure BOOT repeat button");
+
+    if (xTaskCreatePinnedToCore(audio_task, "audio_loopback",
+                                AUDIO_TASK_STACK_SIZE, NULL,
+                                AUDIO_TASK_PRIORITY, &s_task,
+                                AUDIO_TASK_CORE) != pdPASS) {
+        s_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}

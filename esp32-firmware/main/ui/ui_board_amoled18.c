@@ -1,7 +1,7 @@
 /*
- * Strong ui_board_* implementation for the Waveshare ESP32-S3-Touch-AMOLED-1.8
- * (368x448, SH8601). Rendering is done with LVGL 9 through the official
- * managed BSP component, which owns the panel/touch initialization and pins.
+ * Strong ui_board_* implementation for the Waveshare ESP32-S3-Touch-AMOLED-
+ * 1.43C (466x466 round panel). Rendering is done with LVGL 9 through the
+ * project's minimal display BSP based on Waveshare's official example.
  *
  * Design rule: every coordinate derives from s_d, the diameter of a circular
  * "face canvas" (min(width, height)). All expression elements stay inside
@@ -15,21 +15,21 @@
 
 #include "sdkconfig.h"
 
-#if CONFIG_ELDER_UI_BOARD_AMOLED18
+#if CONFIG_ELDER_UI_BOARD_AMOLED143C
 
 #include <string.h>
 
 #include "esp_err.h"
 #include "esp_log.h"
 
-#include "bsp/esp-bsp.h"
+#include "elder_round_bsp.h"
 #include "lvgl.h"
 
 #include "app_state.h"
 #include "ui_board.h"
 #include "ui_board_amoled18.h"
 
-static const char *TAG = "ui_amoled18";
+static const char *TAG = "ui_round143c";
 
 #if LV_VERSION_CHECK(9, 1, 0)
 #define face_clear_flag lv_obj_remove_flag
@@ -56,12 +56,19 @@ static lv_obj_t *s_caption; /* CJK text: names, error messages */
 static lv_obj_t *s_star[3]; /* orbiting sparks for the dizzy animation */
 static lv_obj_t *s_hl_l;    /* eye highlight dots (clipped inside the eyes) */
 static lv_obj_t *s_hl_r;
+static lv_obj_t *s_surprise_nose;
+static lv_obj_t *s_surprise_inner;
+static lv_obj_t *s_alert_bar[3];
+static lv_obj_t *s_alert_dot[3];
 
 static lv_timer_t *s_blink_timer;
 static lv_timer_t *s_think_timer;
+static lv_timer_t *s_surprise_stage_timer;
+static lv_timer_t *s_surprise_end_timer;
 static bool s_blink_enabled;
 static int s_think_phase;
 static bool s_dimmed;
+static app_state_t s_surprise_return_state = APP_STATE_IDLE;
 
 /* Motion interactivity (fed by the IMU task through the public hooks).
  * Gaze values are stored as milli-units so 32-bit writes stay atomic. */
@@ -84,11 +91,18 @@ typedef enum {
     MOUTH_NONE,
 } mouth_mode_t;
 
+static void apply_state(app_state_t state);
+
 /* --- small helpers (LVGL task or under bsp_display_lock) ---------------- */
 
 static void anim_set_height(void *obj, int32_t v)
 {
     lv_obj_set_height((lv_obj_t *)obj, v);
+}
+
+static void anim_set_width(void *obj, int32_t v)
+{
+    lv_obj_set_width((lv_obj_t *)obj, v);
 }
 
 static void anim_translate_x(void *obj, int32_t v)
@@ -99,6 +113,23 @@ static void anim_translate_x(void *obj, int32_t v)
 static void anim_translate_y(void *obj, int32_t v)
 {
     lv_obj_set_style_translate_y((lv_obj_t *)obj, v, 0);
+}
+
+static void restore_standard_canvas(void)
+{
+    lv_obj_set_style_bg_color(lv_screen_active(), lv_color_black(), 0);
+    lv_obj_set_style_bg_color(s_face, lv_color_hex(0x18222E), 0);
+    lv_obj_set_style_bg_grad_color(s_face, lv_color_hex(0x0A0E13), 0);
+    lv_obj_set_style_bg_grad_dir(s_face, LV_GRAD_DIR_VER, 0);
+    face_clear_flag(s_hl_l, LV_OBJ_FLAG_HIDDEN);
+    face_clear_flag(s_hl_r, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_add_flag(s_surprise_nose, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_surprise_inner, LV_OBJ_FLAG_HIDDEN);
+    for (size_t i = 0; i < 3; i++) {
+        lv_obj_add_flag(s_alert_bar[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_alert_dot[i], LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 static void blink_timer_cb(lv_timer_t *timer)
@@ -135,6 +166,14 @@ static void stop_dynamics(void)
         lv_timer_delete(s_think_timer);
         s_think_timer = NULL;
     }
+    if (s_surprise_stage_timer != NULL) {
+        lv_timer_delete(s_surprise_stage_timer);
+        s_surprise_stage_timer = NULL;
+    }
+    if (s_surprise_end_timer != NULL) {
+        lv_timer_delete(s_surprise_end_timer);
+        s_surprise_end_timer = NULL;
+    }
     lv_anim_delete(s_eye_l, NULL);
     lv_anim_delete(s_eye_r, NULL);
     lv_anim_delete(s_open, NULL);
@@ -144,13 +183,18 @@ static void stop_dynamics(void)
     lv_obj_set_style_translate_y(s_eye_l, 0, 0);
     lv_obj_set_style_translate_y(s_eye_r, 0, 0);
     lv_obj_set_style_translate_x(s_face, 0, 0);
+    lv_obj_set_style_translate_y(s_face, 0, 0);
     lv_obj_set_style_translate_y(s_open, 0, 0);
     for (size_t i = 0; i < 3; i++) {
         if (s_star[i] != NULL) {
             lv_anim_delete(s_star[i], NULL);
             lv_obj_add_flag(s_star[i], LV_OBJ_FLAG_HIDDEN);
         }
+        if (s_alert_bar[i] != NULL) {
+            lv_anim_delete(s_alert_bar[i], NULL);
+        }
     }
+    restore_standard_canvas();
 }
 
 static void set_eyes(int32_t w, int32_t h, int32_t dy, lv_color_t color)
@@ -177,6 +221,10 @@ static void set_mouth(mouth_mode_t mode, lv_color_t color, int32_t weight)
     lv_obj_add_flag(s_smile, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_flat, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_open, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_surprise_inner, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_border_width(s_open, 0, 0);
+    lv_obj_set_style_bg_opa(s_open, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_open, LV_RADIUS_CIRCLE, 0);
 
     switch (mode) {
     case MOUTH_SMILE:
@@ -250,8 +298,185 @@ static lv_color_t col_eye(void)    { return lv_color_hex(0xEAF6FF); }
 static lv_color_t col_accent(void) { return lv_color_hex(0x37C8F5); }
 static lv_color_t col_warm(void)   { return lv_color_hex(0xFFC48A); }
 static lv_color_t col_alert(void)  { return lv_color_hex(0xFF8A7A); }
+static lv_color_t col_cream(void)  { return lv_color_hex(0xF4F1E7); }
+static lv_color_t col_ink(void)    { return lv_color_hex(0x11100E); }
+static lv_color_t col_yellow(void) { return lv_color_hex(0xF6C83F); }
+static lv_color_t col_coral(void)  { return lv_color_hex(0xE9937E); }
 
 /* --- expression presets -------------------------------------------------- */
+
+static void show_alert_marks(size_t count, bool large)
+{
+    const int32_t start_x = large ? FD(15) : FD(12);
+    const int32_t gap = large ? FD(8) : FD(7);
+    const int32_t top_y = large ? -FD(28) : -FD(25);
+    const int32_t bar_w = large ? FD(4) : FD(3);
+    const int32_t bar_h = large ? FD(13) : FD(10);
+    const int32_t dot_d = large ? FD(4) : FD(3);
+
+    for (size_t i = 0; i < 3; i++) {
+        lv_anim_delete(s_alert_bar[i], NULL);
+        if (i >= count) {
+            lv_obj_add_flag(s_alert_bar[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_alert_dot[i], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+
+        const int32_t x = start_x + (int32_t)i * gap;
+        lv_obj_set_size(s_alert_bar[i], bar_w, bar_h);
+        lv_obj_align(s_alert_bar[i], LV_ALIGN_CENTER, x, top_y);
+        lv_obj_set_style_bg_color(s_alert_bar[i], col_yellow(), 0);
+        face_clear_flag(s_alert_bar[i], LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_set_size(s_alert_dot[i], dot_d, dot_d);
+        lv_obj_align(s_alert_dot[i], LV_ALIGN_CENTER, x, top_y + bar_h);
+        lv_obj_set_style_bg_color(s_alert_dot[i], col_yellow(), 0);
+        face_clear_flag(s_alert_dot[i], LV_OBJ_FLAG_HIDDEN);
+
+        lv_anim_t pulse;
+        lv_anim_init(&pulse);
+        lv_anim_set_var(&pulse, s_alert_bar[i]);
+        lv_anim_set_values(&pulse, bar_h - FD(2), bar_h + FD(2));
+        lv_anim_set_duration(&pulse, 220);
+        lv_anim_set_playback_duration(&pulse, 220);
+        lv_anim_set_repeat_count(&pulse, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_delay(&pulse, (uint32_t)i * 70);
+        lv_anim_set_path_cb(&pulse, lv_anim_path_ease_in_out);
+        lv_anim_set_exec_cb(&pulse, anim_set_height);
+        lv_anim_start(&pulse);
+    }
+}
+
+static void surprise_small(void)
+{
+    lv_obj_set_style_bg_color(lv_screen_active(), col_cream(), 0);
+    lv_obj_set_style_bg_color(s_face, col_cream(), 0);
+    lv_obj_set_style_bg_grad_color(s_face, col_cream(), 0);
+    lv_obj_set_style_bg_grad_dir(s_face, LV_GRAD_DIR_NONE, 0);
+    lv_obj_add_flag(s_hl_l, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_hl_r, LV_OBJ_FLAG_HIDDEN);
+
+    set_eyes(FD(6), FD(2), -FD(15), col_ink());
+    lv_obj_align(s_eye_l, LV_ALIGN_CENTER, -FD(14), -FD(15));
+    lv_obj_align(s_eye_r, LV_ALIGN_CENTER, FD(14), -FD(15));
+
+    lv_obj_set_size(s_surprise_nose, FD(4), FD(4));
+    lv_obj_align(s_surprise_nose, LV_ALIGN_CENTER, 0, -FD(4));
+    face_clear_flag(s_surprise_nose, LV_OBJ_FLAG_HIDDEN);
+
+    set_mouth(MOUTH_NONE, col_ink(), 0);
+    lv_obj_set_size(s_open, FD(8), FD(16));
+    lv_obj_align(s_open, LV_ALIGN_CENTER, 0, FD(13));
+    lv_obj_set_style_bg_color(s_open, col_cream(), 0);
+    lv_obj_set_style_border_color(s_open, col_ink(), 0);
+    lv_obj_set_style_border_width(s_open, FD(2), 0);
+    lv_obj_set_style_radius(s_open, FD(3), 0);
+    face_clear_flag(s_open, LV_OBJ_FLAG_HIDDEN);
+
+    set_texts(NULL, NULL);
+    show_alert_marks(3, false);
+
+    lv_anim_t eye_open;
+    lv_anim_init(&eye_open);
+    lv_anim_set_values(&eye_open, FD(2), FD(14));
+    lv_anim_set_duration(&eye_open, 320);
+    lv_anim_set_path_cb(&eye_open, lv_anim_path_overshoot);
+    lv_anim_set_exec_cb(&eye_open, anim_set_height);
+    lv_anim_set_var(&eye_open, s_eye_l);
+    lv_anim_start(&eye_open);
+    lv_anim_set_delay(&eye_open, 45);
+    lv_anim_set_var(&eye_open, s_eye_r);
+    lv_anim_start(&eye_open);
+
+    lv_anim_t mouth_wake;
+    lv_anim_init(&mouth_wake);
+    lv_anim_set_var(&mouth_wake, s_open);
+    lv_anim_set_values(&mouth_wake, FD(8), FD(18));
+    lv_anim_set_duration(&mouth_wake, 360);
+    lv_anim_set_path_cb(&mouth_wake, lv_anim_path_overshoot);
+    lv_anim_set_exec_cb(&mouth_wake, anim_set_width);
+    lv_anim_start(&mouth_wake);
+
+    lv_anim_t bounce;
+    lv_anim_init(&bounce);
+    lv_anim_set_var(&bounce, s_face);
+    lv_anim_set_values(&bounce, FD(4), 0);
+    lv_anim_set_duration(&bounce, 420);
+    lv_anim_set_path_cb(&bounce, lv_anim_path_overshoot);
+    lv_anim_set_exec_cb(&bounce, anim_translate_y);
+    lv_anim_start(&bounce);
+}
+
+static void surprise_large(void)
+{
+    set_eyes(FD(8), FD(22), -FD(14), col_ink());
+    lv_obj_align(s_eye_l, LV_ALIGN_CENTER, -FD(16), -FD(14));
+    lv_obj_align(s_eye_r, LV_ALIGN_CENTER, FD(16), -FD(14));
+
+    lv_obj_set_size(s_surprise_nose, FD(4), FD(4));
+    lv_obj_align(s_surprise_nose, LV_ALIGN_CENTER, 0, -FD(2));
+
+    lv_anim_delete(s_open, NULL);
+    lv_obj_set_width(s_open, FD(23));
+    lv_obj_align(s_open, LV_ALIGN_CENTER, 0, FD(18));
+    lv_obj_set_style_bg_color(s_open, col_ink(), 0);
+    lv_obj_set_style_border_width(s_open, 0, 0);
+    lv_obj_set_style_radius(s_open, LV_RADIUS_CIRCLE, 0);
+    face_clear_flag(s_open, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_set_size(s_surprise_inner, FD(11), FD(17));
+    lv_obj_align(s_surprise_inner, LV_ALIGN_CENTER, 0, FD(3));
+    face_clear_flag(s_surprise_inner, LV_OBJ_FLAG_HIDDEN);
+
+    lv_anim_t mouth_pop;
+    lv_anim_init(&mouth_pop);
+    lv_anim_set_var(&mouth_pop, s_open);
+    lv_anim_set_values(&mouth_pop, FD(14), FD(30));
+    lv_anim_set_duration(&mouth_pop, 300);
+    lv_anim_set_path_cb(&mouth_pop, lv_anim_path_overshoot);
+    lv_anim_set_exec_cb(&mouth_pop, anim_set_height);
+    lv_anim_start(&mouth_pop);
+
+    lv_anim_t eye_pop;
+    lv_anim_init(&eye_pop);
+    lv_anim_set_values(&eye_pop, FD(12), FD(22));
+    lv_anim_set_duration(&eye_pop, 280);
+    lv_anim_set_path_cb(&eye_pop, lv_anim_path_overshoot);
+    lv_anim_set_exec_cb(&eye_pop, anim_set_height);
+    lv_anim_set_var(&eye_pop, s_eye_l);
+    lv_anim_start(&eye_pop);
+    lv_anim_set_delay(&eye_pop, 50);
+    lv_anim_set_var(&eye_pop, s_eye_r);
+    lv_anim_start(&eye_pop);
+
+    show_alert_marks(2, true);
+}
+
+static void surprise_stage_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    s_surprise_stage_timer = NULL;
+    surprise_large();
+}
+
+static void surprise_end_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    s_surprise_end_timer = NULL;
+    apply_state(s_surprise_return_state);
+}
+
+static void surprise_begin(app_state_t return_state)
+{
+    stop_dynamics();
+    s_surprise_return_state = return_state;
+    surprise_small();
+    s_surprise_stage_timer = lv_timer_create(surprise_stage_cb, 550, NULL);
+    lv_timer_set_repeat_count(s_surprise_stage_timer, 1);
+
+    s_surprise_end_timer = lv_timer_create(surprise_end_cb, 2300, NULL);
+    lv_timer_set_repeat_count(s_surprise_end_timer, 1);
+}
 
 static void expr_neutral(void)
 {
@@ -612,6 +837,38 @@ static void build_face(void)
     s_open = lv_obj_create(s_face);
     lv_obj_set_style_radius(s_open, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_border_width(s_open, 0, 0);
+    lv_obj_set_style_pad_all(s_open, 0, 0);
+    lv_obj_set_style_clip_corner(s_open, true, 0);
+
+    s_surprise_inner = lv_obj_create(s_open);
+    lv_obj_set_style_radius(s_surprise_inner, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(s_surprise_inner, 0, 0);
+    lv_obj_set_style_bg_color(s_surprise_inner, col_coral(), 0);
+    lv_obj_set_style_pad_all(s_surprise_inner, 0, 0);
+    face_clear_flag(s_surprise_inner, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_surprise_inner, LV_OBJ_FLAG_HIDDEN);
+
+    s_surprise_nose = lv_obj_create(s_face);
+    lv_obj_set_style_radius(s_surprise_nose, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(s_surprise_nose, 0, 0);
+    lv_obj_set_style_bg_color(s_surprise_nose, col_ink(), 0);
+    lv_obj_set_style_pad_all(s_surprise_nose, 0, 0);
+    face_clear_flag(s_surprise_nose, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_surprise_nose, LV_OBJ_FLAG_HIDDEN);
+
+    for (size_t i = 0; i < 3; i++) {
+        s_alert_bar[i] = lv_obj_create(s_face);
+        s_alert_dot[i] = lv_obj_create(s_face);
+        lv_obj_t *parts[] = {s_alert_bar[i], s_alert_dot[i]};
+        for (size_t j = 0; j < 2; j++) {
+            lv_obj_set_style_radius(parts[j], LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_border_width(parts[j], 0, 0);
+            lv_obj_set_style_bg_color(parts[j], col_yellow(), 0);
+            lv_obj_set_style_pad_all(parts[j], 0, 0);
+            face_clear_flag(parts[j], LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(parts[j], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 
     /* Dizzy sparks: small pastel dots, hidden until a shake is detected. */
     static const uint32_t star_palette[3] = {0xFFC48A, 0xFFA0B4, 0x7FDBFF};
@@ -632,8 +889,8 @@ static void build_face(void)
     lv_obj_align(s_status, LV_ALIGN_CENTER, 0, FD(34));
 
     s_caption = lv_label_create(s_face);
-#if LV_FONT_SIMSUN_16_CJK
-    lv_obj_set_style_text_font(s_caption, &lv_font_simsun_16_cjk, 0);
+#if LV_FONT_SOURCE_HAN_SANS_SC_16_CJK
+    lv_obj_set_style_text_font(s_caption, &lv_font_source_han_sans_sc_16_cjk, 0);
 #endif
     lv_obj_set_style_text_color(s_caption, col_eye(), 0);
     lv_obj_set_width(s_caption, FD(70));
@@ -663,7 +920,7 @@ esp_err_t ui_board_init(void)
     build_face();
     bsp_display_unlock();
 
-    ESP_LOGI(TAG, "AMOLED 1.8 face UI ready, canvas d=%d px", (int)s_d);
+    ESP_LOGI(TAG, "AMOLED 1.43C round face UI ready, canvas d=%d px", (int)s_d);
     return ESP_OK;
 }
 
@@ -683,19 +940,7 @@ esp_err_t ui_board_play_boot_animation(void)
         return ESP_ERR_TIMEOUT;
     }
     apply_state(APP_STATE_BOOTING);
-    /* Eyes pop open with a slight overshoot, then a smile appears. */
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_values(&a, FD(2), FD(24));
-    lv_anim_set_duration(&a, 650);
-    lv_anim_set_path_cb(&a, lv_anim_path_overshoot);
-    lv_anim_set_exec_cb(&a, anim_set_height);
-    lv_anim_set_var(&a, s_eye_l);
-    lv_anim_start(&a);
-    lv_anim_set_var(&a, s_eye_r);
-    lv_anim_set_delay(&a, 120);
-    lv_anim_start(&a);
-    set_mouth(MOUTH_SMILE, col_eye(), FD(3));
+    surprise_begin(APP_STATE_IDLE);
     bsp_display_unlock();
     return ESP_OK;
 }
@@ -723,9 +968,7 @@ esp_err_t ui_board_show_face(const char *emotion, float intensity)
     } else if (strcmp(emotion, "sad") == 0) {
         expr_sad(NULL, NULL);
     } else if (strcmp(emotion, "surprised") == 0) {
-        set_eyes(FD(17), FD(22), -FD(10), col_eye());
-        set_mouth(MOUTH_O, col_eye(), 0);
-        set_texts(NULL, NULL);
+        surprise_begin(s_current_state);
     } else if (strcmp(emotion, "confused") == 0) {
         set_eyes(FD(14), FD(18), -FD(10), col_eye());
         lv_obj_set_size(s_eye_r, FD(11), FD(11));
@@ -799,4 +1042,4 @@ esp_err_t ui_board_play_sound(const char *name)
     return ESP_ERR_NOT_SUPPORTED;
 }
 
-#endif /* CONFIG_ELDER_UI_BOARD_AMOLED18 */
+#endif /* CONFIG_ELDER_UI_BOARD_AMOLED143C */

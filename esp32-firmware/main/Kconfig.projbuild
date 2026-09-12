@@ -95,27 +95,58 @@ menu "Elder companion firmware"
     config ELDER_BOOT_ANIMATION_MS
         int "Boot-state display duration (ms)"
         range 0 10000
-        default 1200
+        default 2500
 
-    config ELDER_UI_BOARD_AMOLED18
-        bool "Render UI on Waveshare ESP32-S3-Touch-AMOLED-1.8"
+    config ELDER_UI_BOARD_AMOLED143C
+        bool "Render UI on Waveshare ESP32-S3-Touch-AMOLED-1.43C"
         default y
         help
-            Draw faces and states on the Waveshare 1.8" AMOLED through the
-            official managed BSP (waveshare/esp32_s3_touch_amoled_1_8).
-            All expression elements live inside a circular canvas sized
-            min(width, height), so the same code later ports to the round
-            1.43C target. Disable to fall back to the log-only UI stub.
+            Draw native LVGL vector faces on the 466x466 round AMOLED.
+            The display initialization follows Waveshare's official ESP-IDF
+            5.5.3 example for the N8R8 board. Disable this option to use the
+            log-only UI stub.
 
     config ELDER_UI_MOTION
-        bool "IMU motion reactions (gaze follow + dizzy)"
-        default y
-        depends on ELDER_UI_BOARD_AMOLED18
+        bool
+        default n
         help
-            Sample the on-board QMI8658 IMU: tilting the board makes the
-            eyes look downhill; shaking it plays a short dizzy animation.
-            Only active in quiet states (IDLE / welcome / comfort), never
-            during conversation, privacy or error states.
+            Reserved for boards with a QMI8658 IMU. The 1.43C round display
+            does not expose that sensor, so motion reactions stay disabled.
+
+    menu "On-board audio verification"
+        config ELDER_AUDIO_LOOPBACK_TEST
+            bool "Record and replay through the built-in microphones and speaker"
+            default y
+            depends on ELDER_UI_BOARD_AMOLED143C
+            help
+                Initialize the ES7210 microphone codec and ES8311 speaker
+                codec used by the Waveshare 1.43C board. After startup the
+                firmware runs one three-second record/replay cycle. Press the
+                on-board BOOT key to repeat it without reflashing.
+
+        if ELDER_AUDIO_LOOPBACK_TEST
+            config ELDER_AUDIO_RECORD_SECONDS
+                int "Loopback recording duration (seconds)"
+                range 1 8
+                default 3
+
+            config ELDER_AUDIO_SPEAKER_VOLUME
+                int "Loopback speaker volume (percent)"
+                range 1 100
+                default 100
+
+            config ELDER_AUDIO_MIC_GAIN_DB
+                int "Microphone input gain (dB)"
+                range 0 45
+                default 30
+                help
+                    The ES7210 reference gain gives clear speech without
+                    relying on excessive digital amplification. The loopback
+                    then applies a speech-band filter, percentile noise
+                    estimation, soft expansion, voice-only automatic gain,
+                    and soft limiting.
+        endif
+    endmenu
 
     menu "External buttons"
         config ELDER_WAKE_BUTTON_ENABLED

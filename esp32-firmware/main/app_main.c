@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 
 #include "app_state.h"
+#include "audio_loopback.h"
 #include "buttons.h"
 #include "heartbeat.h"
 #include "protocol.h"
@@ -85,6 +86,14 @@ void app_main(void)
         ESP_LOGE(TAG, "heartbeat initialization failed: %s",
                  esp_err_to_name(heartbeat_result));
     }
+
+#if CONFIG_ELDER_AUDIO_LOOPBACK_TEST
+    const esp_err_t audio_result = audio_loopback_start();
+    if (audio_result != ESP_OK) {
+        ESP_LOGE(TAG, "on-board audio verification failed to start: %s",
+                 esp_err_to_name(audio_result));
+    }
+#endif
 
 #if CONFIG_ELDER_UI_MOTION
     /* Motion features are best-effort: a missing IMU only logs a warning. */

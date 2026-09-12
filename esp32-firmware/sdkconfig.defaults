@@ -8,15 +8,17 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 # Reasonable FreeRTOS timer/task defaults for this small Phase-2 skeleton.
 CONFIG_FREERTOS_HZ=1000
 
-# --- Waveshare ESP32-S3-Touch-AMOLED-1.8 display adapter -------------------
-# Values mirror the official BSP example (14_lvgl_demo_v9). The LVGL build
-# needs the 16MB flash / 8MB factory partition and octal PSRAM.
+# --- Waveshare ESP32-S3-Touch-AMOLED-1.43C round display ------------------
+# Values mirror the official ESP-IDF 5.5.3 LVGL 9 example for the N8R8 board.
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
 CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
@@ -25,4 +27,21 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # Chinese display names ("张奶奶") and error messages can render.
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_24=y
-CONFIG_LV_FONT_SIMSUN_16_CJK=y
+CONFIG_LV_FONT_SOURCE_HAN_SANS_SC_16_CJK=y
+CONFIG_LV_USE_BUILTIN_MALLOC=n
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_USE_CLIB_STRING=y
+CONFIG_LV_USE_CLIB_SPRINTF=y
+CONFIG_LV_DEF_REFR_PERIOD=15
+CONFIG_LV_OS_FREERTOS=y
+CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=2
+CONFIG_LV_OBJ_STYLE_CACHE=y
+
+# Factory-matched ES7210 microphone + ES8311 speaker verification. The first
+# cycle runs automatically; GPIO0 (BOOT) repeats it. The first hardware
+# verification uses the same 100% volume as Waveshare's factory audio example.
+# ES7210 reference gain is paired with voice-only AGC capped at 2x.
+CONFIG_ELDER_AUDIO_LOOPBACK_TEST=y
+CONFIG_ELDER_AUDIO_RECORD_SECONDS=3
+CONFIG_ELDER_AUDIO_SPEAKER_VOLUME=100
+CONFIG_ELDER_AUDIO_MIC_GAIN_DB=30
