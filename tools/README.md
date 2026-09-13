@@ -1,4 +1,20 @@
-# 无硬件联调工具
+# 联调与实机检查工具
+
+## 实机检查（真实 1.43C 圆屏终端）
+
+`device_check.py` 通过 USB 串口与已烧录固件的设备通信，依赖 `make setup` 安装的 pyserial。使用前关闭 Arduino IDE 串口监视器等占用串口的程序：
+
+```bash
+pi-backend/.venv/bin/python tools/device_check.py                       # 逐个发送 7 种表情并确认
+pi-backend/.venv/bin/python tools/device_check.py --auto --hold 8       # 自动轮播，不逐个确认
+pi-backend/.venv/bin/python tools/device_check.py --demo                # 让设备自己循环展示全部表情
+pi-backend/.venv/bin/python tools/device_check.py --sound speaker_test  # 播放内置喇叭测试音
+pi-backend/.venv/bin/python tools/device_check.py --watch 30 -v         # 只监听心跳与音频自检输出
+```
+
+默认自动选择 `/dev/cu.usbmodem*`（macOS）或 `/dev/ttyACM*`（Linux），Windows 需用 `--port COM5` 指定。脚本打开串口时保持 DTR/RTS 不变，不会让板子重启。
+
+`make_speaker_test_clip.py` 用 macOS 自带的中文语音重新生成固件内置的喇叭测试音 `esp32-firmware/main/audio/speaker_test.pcm`，改完需重新编译烧录固件。
 
 ## ESP32 模拟器
 
