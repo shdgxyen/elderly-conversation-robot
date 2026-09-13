@@ -37,6 +37,8 @@ idf_component_register(
         esp_driver_usb_serial_jtag
         elder_round_bsp
         lvgl__lvgl
+    EMBED_FILES
+        "audio/speaker_test.pcm"
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE

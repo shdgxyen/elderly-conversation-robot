@@ -84,7 +84,8 @@ Raspberry Pi to ESP32 examples:
 {"type":"user","recognized":true,"display_name":"张奶奶"}
 {"type":"error","code":"NETWORK_ERROR","message":"网络连接失败"}
 {"type":"display","brightness":70}
-{"type":"sound","name":"wake"}
+{"type":"sound","name":"speaker_test"}
+{"type":"face","emotion":"demo"}
 ```
 
 The accepted state values are:
@@ -94,6 +95,12 @@ BOOTING IDLE FACE_SCANNING USER_RECOGNIZED UNKNOWN_USER LISTENING THINKING
 SPEAKING CONFUSED COMFORT PRIVACY_MIC_OFF PRIVACY_CAMERA_OFF NETWORK_ERROR
 API_ERROR LOW_POWER
 ```
+
+`face` accepts `smile`/`happy`, `sad`, `surprised`, `confused`, `comfort`/`gentle`,
+`wink`, `sleepy` and the special `demo`, which makes the device cycle through
+every animated expression until another face, user or error command arrives.
+`sound` currently plays only `speaker_test`; other names are reported as not
+supported. Expression details are in `docs/EXPRESSION_UI.md`.
 
 ESP32 to Raspberry Pi examples:
 
@@ -159,6 +166,14 @@ Duration, volume, and microphone gain are configurable under
 This loopback proves only the local microphone/codec/amplifier/speaker path; it
 does not yet prove network speech recognition, Kimi, or speech synthesis.
 
+To check the speaker on its own, send `{"type":"sound","name":"speaker_test"}`
+or run `tools/device_check.py --sound speaker_test`. The firmware plays a 13.6 s
+clip embedded from `main/audio/speaker_test.pcm` (16 kHz mono PCM16): a Chinese
+voice prompt for intelligibility, an ascending chime, a 150 Hz-6 kHz sweep that
+exposes rattle or distortion, and a closing prompt. It runs after any
+record/replay cycle in progress and shows the speaking expression. Regenerate
+the clip on macOS with `python3 tools/make_speaker_test_clip.py`.
+
 The board's two side keys are BOOT and PWR. Only BOOT triggers the repeat test;
 PWR controls board power and is not an application input.
 
@@ -179,7 +194,8 @@ main/
 ├── protocol/              bounded cJSON command/event codec
 ├── comms/usb_serial.[ch]  selectable USB Serial/JTAG or UART JSONL framing
 ├── comms/heartbeat.[ch]   periodic uptime report
-├── audio/audio_loopback.* ES7210 -> PSRAM -> ES8311 verification
+├── audio/audio_loopback.* ES7210 -> PSRAM -> ES8311 verification, speaker test
+├── audio/speaker_test.pcm  embedded speaker test clip
 ├── input/buttons.[ch]     optional debounced GPIO inputs
 └── ui/                    UI facade and native round-display expressions
 ```

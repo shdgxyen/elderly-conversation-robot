@@ -10,6 +10,7 @@
 #include "cJSON.h"
 
 #include "app_state.h"
+#include "audio_loopback.h"
 #include "ui.h"
 #include "usb_serial.h"
 
@@ -282,6 +283,12 @@ static protocol_result_t handle_sound(const cJSON *root)
     if (!json_string_is_bounded(name, SOUND_NAME_MAX_BYTES, false)) {
         return PROTOCOL_RESULT_INVALID_MESSAGE;
     }
+#if CONFIG_ELDER_AUDIO_LOOPBACK_TEST
+    /* The only real sound so far is the built-in speaker test clip. */
+    if (strcmp(name->valuestring, "speaker_test") == 0) {
+        return action_result(audio_loopback_request_speaker_test());
+    }
+#endif
     return action_result(ui_play_sound(name->valuestring));
 }
 
