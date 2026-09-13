@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class DeviceState(str, Enum):
-    """All device states defined by ``docs/PROJECT_SPEC.md``."""
+    """All device states shared with the ESP32 firmware (see ``docs/PROTOCOL.md``)."""
 
     BOOTING = "BOOTING"
     IDLE = "IDLE"

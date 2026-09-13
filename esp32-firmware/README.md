@@ -1,7 +1,7 @@
 # ESP32-S3 firmware for the 1.43C round terminal
 
-This directory contains the ESP-IDF skeleton for the round-screen terminal in
-`docs/PROJECT_SPEC.md`. Its current responsibility is deliberately small:
+This directory contains the ESP-IDF firmware for the round-screen terminal.
+Its current responsibility is deliberately small:
 
 - maintain every specified device state;
 - receive bounded JSON Lines commands from the Raspberry Pi;

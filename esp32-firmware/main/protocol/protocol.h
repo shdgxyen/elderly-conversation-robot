@@ -24,7 +24,7 @@ protocol_result_t protocol_handle_line(const char *line, size_t length);
 
 const char *protocol_result_to_string(protocol_result_t result);
 
-/** Emit one of the ESP32 -> Pi button events from PROJECT_SPEC.md. */
+/** Emit one of the ESP32 -> Pi button events listed in docs/PROTOCOL.md. */
 esp_err_t protocol_send_button_event(const char *event_name);
 
 /** Emit {"type":"heartbeat","uptime_ms":...}. */

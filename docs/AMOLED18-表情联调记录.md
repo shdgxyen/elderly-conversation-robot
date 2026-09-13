@@ -2,7 +2,6 @@
 
 > 日期：2026-07-12
 > 结果：表情 UI 预开发成功——1.8 寸方屏上以圆形画布渲染 15 个状态的表情，协议驱动切换正常。
-> 本记录同时是讲义第八章的实战素材：每个坑都对应一个可讲的知识点。
 >
 > **2026-09 更名说明**：固件已切换到 1.43C 圆屏，文中的 `ui_board_amoled18.c/.h`、`ui_amoled18_*()` 与 `CONFIG_ELDER_UI_BOARD_AMOLED18` 现分别为 `ui_board_amoled143c.c/.h`、`ui_amoled143c_*()` 与 `CONFIG_ELDER_UI_BOARD_AMOLED143C`，微雪 1.8 托管 BSP 和 QMI8658 依赖也已移除。本文保留旧名以忠实记录当时的联调过程，当前实现见 [EXPRESSION_UI.md](EXPRESSION_UI.md)。
 

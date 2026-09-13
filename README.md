@@ -24,7 +24,7 @@
 **工具与文档**
 
 - [`tools/device_check.py`](tools/device_check.py)：连接真实设备逐个查看表情、启动表情轮播、播放喇叭测试音；
-- 协议、数据库、硬件、Windows 开发环境与[圆屏表情实现](docs/EXPRESSION_UI.md)文档，以及教学方案和学生学习手册。
+- 协议、数据库、硬件、Windows 开发环境与[圆屏表情实现](docs/EXPRESSION_UI.md)文档。
 
 ## 快速开始
 
@@ -81,7 +81,7 @@ USB 口承载 JSON Lines 协议，ESP-IDF 应用日志走 UART0（GPIO43/44）�
 ## 仓库结构
 
 ```text
-docs/               项目规格、协议、数据库、硬件、表情实现、路线图与教学资料
+docs/               协议、数据库、硬件、表情实现、开发环境与路线图
 pi-backend/         Raspberry Pi FastAPI 后端
 esp32-firmware/     ESP-IDF 固件（1.43C 圆屏终端）
 tools/              模拟器、实机检查与测试音生成工具

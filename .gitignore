@@ -31,6 +31,8 @@ esp32-firmware/dependencies.lock
 # Generated mock media
 *.wav
 
-# Office 教学材料由 docs/ 下的 Markdown 源文件生成，不入库
+# 教学材料只保留在本地，不入库
 *.docx
 *.pptx
+docs/教学方案.md
+docs/学生学习手册.md
