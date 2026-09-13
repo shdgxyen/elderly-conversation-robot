@@ -16,7 +16,7 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `esp32-firmware/main/ui/ui_board_amoled18.c` | 表情的核心实现；文件名是旧 1.8 英寸版本遗留，文件内容已经适配 1.43C 圆屏。 |
+| `esp32-firmware/main/ui/ui_board_amoled143c.c` | 1.43C 圆屏的表情核心实现。 |
 | `esp32-firmware/main/ui/ui_states.c` | 接收机器人状态变化，并转交给屏幕适配层。 |
 | `esp32-firmware/main/ui/ui_faces.c` | 接收独立的表情名称和强度，例如 `happy`、`surprised`。 |
 | `esp32-firmware/main/ui/ui_main.c` | 初始化 UI，并用互斥锁保护 LVGL 调用。 |
@@ -29,7 +29,7 @@
 
 ## 核心函数
 
-核心文件 `ui_board_amoled18.c` 中的重要函数如下：
+核心文件 `ui_board_amoled143c.c` 中的重要函数如下：
 
 | 函数 | 作用 |
 | --- | --- |
@@ -146,7 +146,7 @@ LISTENING（开始收音）
 
 ### 调整现有表情
 
-在 `ui_board_amoled18.c` 的 `apply_state()` 中找到目标状态，然后调整：
+在 `ui_board_amoled143c.c` 的 `apply_state()` 中找到目标状态，然后调整：
 
 - `set_eyes()` 的宽度、高度、纵向位置和颜色；
 - `set_mouth()` 的嘴型、颜色和线宽；
@@ -180,6 +180,5 @@ idf.py build
 
 ## 已知遗留项
 
-- `ui_board_amoled18.c/.h` 的文件名来自旧 1.8 英寸方屏版本，内容已经是 1.43C 圆屏实现；后续可单独重命名，避免队友误解。
 - `docs/AMOLED18-表情联调记录.md` 记录的是旧方屏阶段，不代表当前圆屏实现。
 - 当前仓库没有保存可证明开发板最后一次烧录来源的 `build/`、`sdkconfig` 或固件二进制；这些生成物按设计由 `.gitignore` 排除。

@@ -218,9 +218,9 @@ idf.py set-target esp32s3
 idf.py build
 ```
 
-首次编译会下载受管组件，包括 Waveshare AMOLED BSP、LVGL 和 QMI8658 IMU 驱动，因此需要联网，而且用时会明显长于后续编译。
+首次编译会下载受管组件，包括 LVGL、SH8601 屏幕驱动、LVGL 显示适配层和 ES8311/ES7210 音频编解码驱动，因此需要联网，而且用时会明显长于后续编译。
 
-当前默认配置针对 `ESP32-S3-Touch-AMOLED-1.8`。需要查看或调整配置时：
+当前默认配置针对 `ESP32-S3-Touch-AMOLED-1.43C`（N8R8，466×466 圆屏）。需要查看或调整配置时：
 
 ```powershell
 idf.py menuconfig
@@ -258,14 +258,18 @@ idf.py -p COM5 erase-flash
 idf.py -p COM5 flash monitor
 ```
 
-烧录完成后，可在日志中查找：
+烧录完成后，USB 口上会先出现 ROM 和二级引导程序的启动日志。应用启动后 ESP-IDF 日志改走 UART0（GPIO43/44），USB 口只输出 JSON Lines，因此 `AMOLED 1.43C round face UI ready` 这类应用日志在 USB 口上看不到。开机录音自检正常时可以看到（`uptime_ms` 数值会不同）：
 
 ```text
-AMOLED 1.8 face UI ready
-IMU motion task started
+{"type":"audio_status","stage":"ready","code":0}
+{"type":"audio_status","stage":"recording_started","code":0}
+{"type":"audio_status","stage":"playback_completed","code":0}
+{"type":"heartbeat","uptime_ms":13000}
 ```
 
-IMU 眼神方向和摇晃触发阈值仍需根据实际板卡进行标定。
+所有 `audio_status` 的 `code` 都应为 `0`，之后每 5 秒一条心跳。
+
+1.43C 圆屏没有 IMU，眼神跟随和摇晃反应默认关闭。上电后固件会自动做一次三秒录音回放：对着麦克风说话，喇叭应放出刚才的声音；按板上 BOOT 键可重复测试，无需重新烧录。
 
 ## 7. 连接真实 ESP32 与后端
 

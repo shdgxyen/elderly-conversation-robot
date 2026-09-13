@@ -2,7 +2,7 @@
 # the same static archive: the linker satisfies ui_board_* from whichever
 # object it pulls first and may never load the adapter. Pick exactly one.
 if(CONFIG_ELDER_UI_BOARD_AMOLED143C)
-    set(ELDER_UI_BOARD_SRC "ui/ui_board_amoled18.c")
+    set(ELDER_UI_BOARD_SRC "ui/ui_board_amoled143c.c")
 else()
     set(ELDER_UI_BOARD_SRC "ui/ui_board_stub.c")
 endif()

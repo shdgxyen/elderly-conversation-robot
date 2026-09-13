@@ -8,7 +8,7 @@ extern "C" {
 
 /**
  * Start the QMI8658 IMU sampling task (gaze tracking + shake detection).
- * Feeds the AMOLED-1.8 face adapter through its thread-safe motion hooks.
+ * Feeds the AMOLED-1.43C face adapter through its thread-safe motion hooks.
  * Returns ESP_ERR_NOT_FOUND when no IMU responds on the shared I2C bus;
  * the firmware keeps running without motion features in that case.
  */

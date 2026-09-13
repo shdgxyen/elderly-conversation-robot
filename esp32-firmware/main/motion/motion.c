@@ -7,7 +7,7 @@
  *   triggers a short dizzy animation in the face adapter.
  *
  * The sensor task never touches LVGL. It publishes values through the
- * thread-safe hooks in ui_board_amoled18.h; an LVGL-side timer consumes
+ * thread-safe hooks in ui_board_amoled143c.h; an LVGL-side timer consumes
  * them. This keeps sensor code and UI code fully decoupled.
  */
 
@@ -30,7 +30,7 @@
 #include "qmi8658.h"
 
 #include "motion.h"
-#include "ui_board_amoled18.h"
+#include "ui_board_amoled143c.h"
 
 static const char *TAG = "motion";
 
@@ -84,7 +84,7 @@ static void motion_task(void *arg)
                                     -1.0f, 1.0f);
             gaze_x += GAZE_LOWPASS_ALPHA * (tx - gaze_x);
             gaze_y += GAZE_LOWPASS_ALPHA * (ty - gaze_y);
-            ui_amoled18_set_gaze(gaze_x, gaze_y);
+            ui_amoled143c_set_gaze(gaze_x, gaze_y);
 
             /* --- shake detection from gyro magnitude ------------------ */
             const float mag = sqrtf(data.gyroX * data.gyroX +
@@ -101,7 +101,7 @@ static void motion_task(void *arg)
                 cooldown_until = now + pdMS_TO_TICKS(SHAKE_COOLDOWN_MS);
                 shake_streak = 0;
                 ESP_LOGI(TAG, "shake detected (%.0f dps)", (double)mag);
-                ui_amoled18_notify_shake();
+                ui_amoled143c_notify_shake();
             }
         }
         vTaskDelay(pdMS_TO_TICKS(MOTION_SAMPLE_PERIOD_MS));

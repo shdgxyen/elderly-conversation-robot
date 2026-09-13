@@ -27,7 +27,7 @@
 
 #include "app_state.h"
 #include "ui_board.h"
-#include "ui_board_amoled18.h"
+#include "ui_board_amoled143c.h"
 
 static const char *TAG = "ui_round143c";
 
@@ -757,7 +757,7 @@ static void motion_timer_cb(lv_timer_t *timer)
     lv_obj_set_style_translate_y(s_eye_r, dy, 0);
 }
 
-void ui_amoled18_set_gaze(float x, float y)
+void ui_amoled143c_set_gaze(float x, float y)
 {
     if (x > 1.0f) { x = 1.0f; } else if (x < -1.0f) { x = -1.0f; }
     if (y > 1.0f) { y = 1.0f; } else if (y < -1.0f) { y = -1.0f; }
@@ -765,7 +765,7 @@ void ui_amoled18_set_gaze(float x, float y)
     s_gaze_y_mil = (int32_t)(y * 1000.0f);
 }
 
-void ui_amoled18_notify_shake(void)
+void ui_amoled143c_notify_shake(void)
 {
     s_shake_pending = true;
 }
