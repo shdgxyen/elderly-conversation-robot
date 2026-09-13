@@ -95,4 +95,4 @@ web-admin/          后续阶段预留
 - **已在软件完成**：后端文本对话闭环与持久化，已接入通义千问 / Kimi 对话模型（单轮文本）；
 - **下一步：API 联调**：接入语音识别 API，语音合成直接使用现成语音包，接入摄像头表情识别（高兴 / 难过，不做人脸身份识别），把表情判断、对话和圆屏表情串成完整流程。
 
-项目不持久化原始音频或视频。阶段划分见 [`docs/ROADMAP.md`](docs/ROADMAP.md)，详细目标与约束以 [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) 为准。
+项目不持久化原始音频或视频。阶段划分见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
