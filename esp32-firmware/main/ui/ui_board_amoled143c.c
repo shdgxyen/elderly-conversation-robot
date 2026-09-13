@@ -21,6 +21,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_random.h"
 
 #include "elder_round_bsp.h"
 #include "lvgl.h"
@@ -60,12 +61,16 @@ static lv_obj_t *s_surprise_nose;
 static lv_obj_t *s_surprise_inner;
 static lv_obj_t *s_alert_bar[3];
 static lv_obj_t *s_alert_dot[3];
+static lv_obj_t *s_frown;   /* frown arc (sad mouth) */
+static lv_obj_t *s_tear;    /* falling tear of the animated sad face */
 
 static lv_timer_t *s_blink_timer;
 static lv_timer_t *s_think_timer;
+static lv_timer_t *s_glance_timer;
 static lv_timer_t *s_surprise_stage_timer;
 static lv_timer_t *s_surprise_end_timer;
 static bool s_blink_enabled;
+static bool s_glance_enabled;
 static int s_think_phase;
 static bool s_dimmed;
 static app_state_t s_surprise_return_state = APP_STATE_IDLE;
@@ -77,6 +82,9 @@ static volatile int32_t s_gaze_x_mil;
 static volatile int32_t s_gaze_y_mil;
 static volatile bool s_shake_pending;
 static bool s_dizzy_active;
+/* True while a face command runs its own looping animation; the gaze timer
+ * then leaves the eyes alone. */
+static bool s_expression_active;
 static lv_timer_t *s_motion_timer;
 static lv_timer_t *s_dizzy_end_timer;
 
@@ -115,6 +123,233 @@ static void anim_translate_y(void *obj, int32_t v)
     lv_obj_set_style_translate_y((lv_obj_t *)obj, v, 0);
 }
 
+static void anim_set_opa(void *obj, int32_t v)
+{
+    lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
+}
+
+/* Second blink of a double blink: a distinct exec callback keeps it separate
+ * from the first blink that is still running on the same eye. */
+static void anim_set_height_again(void *obj, int32_t v)
+{
+    lv_obj_set_height((lv_obj_t *)obj, v);
+}
+
+/* Endless one-way animation that jumps back to `from` after `pause_ms`. */
+static void start_repeat(lv_obj_t *obj, lv_anim_exec_xcb_t exec, int32_t from,
+                         int32_t to, uint32_t duration_ms, uint32_t delay_ms,
+                         uint32_t pause_ms, lv_anim_path_cb_t path)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, obj);
+    lv_anim_set_values(&a, from, to);
+    lv_anim_set_duration(&a, duration_ms);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_repeat_delay(&a, pause_ms);
+    lv_anim_set_delay(&a, delay_ms);
+    lv_anim_set_path_cb(&a, path);
+    lv_anim_set_exec_cb(&a, exec);
+    lv_anim_start(&a);
+}
+
+/* --- waves: endless sine motion that starts and ends at the rest value ----
+ * Waves use early_apply=false, which also lets several waves share one
+ * object (LVGL only de-duplicates early-applied animations). */
+
+typedef enum {
+    WAVE_TRANSLATE_X,
+    WAVE_TRANSLATE_Y,
+    WAVE_HEIGHT,
+    WAVE_ARC_WIDTH,
+    WAVE_SMILE_SPREAD, /* widens the smile arc symmetrically, in degrees */
+} wave_prop_t;
+
+typedef struct {
+    lv_obj_t *obj;
+    wave_prop_t prop;
+    int32_t base;
+    int32_t amp;
+} wave_t;
+
+#define WAVE_MAX 20
+static wave_t s_waves[WAVE_MAX];
+static size_t s_wave_count; /* reset by stop_dynamics() after deleting anims */
+
+static void wave_exec(lv_anim_t *a, int32_t angle)
+{
+    const wave_t *w = lv_anim_get_user_data(a);
+    const int32_t v = w->base +
+                      (w->amp * lv_trigo_sin((int16_t)(angle % 360))) / LV_TRIGO_SIN_MAX;
+    switch (w->prop) {
+    case WAVE_TRANSLATE_X:
+        lv_obj_set_style_translate_x(w->obj, v, 0);
+        break;
+    case WAVE_TRANSLATE_Y:
+        lv_obj_set_style_translate_y(w->obj, v, 0);
+        break;
+    case WAVE_HEIGHT:
+        lv_obj_set_height(w->obj, LV_MAX(v, 1));
+        break;
+    case WAVE_ARC_WIDTH:
+        lv_obj_set_style_arc_width(w->obj, LV_MAX(v, 1), LV_PART_MAIN);
+        break;
+    case WAVE_SMILE_SPREAD:
+        lv_arc_set_bg_angles(w->obj, 25 - v, 155 + v);
+        break;
+    }
+}
+
+static void start_wave(lv_obj_t *obj, wave_prop_t prop, int32_t base,
+                       int32_t amp, uint32_t period_ms, uint32_t delay_ms)
+{
+    if (s_wave_count >= WAVE_MAX) {
+        return;
+    }
+    wave_t *w = &s_waves[s_wave_count++];
+    *w = (wave_t){.obj = obj, .prop = prop, .base = base, .amp = amp};
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, obj);
+    lv_anim_set_user_data(&a, w);
+    lv_anim_set_custom_exec_cb(&a, wave_exec);
+    lv_anim_set_values(&a, 0, 360);
+    lv_anim_set_duration(&a, period_ms);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_delay(&a, delay_ms);
+    lv_anim_set_early_apply(&a, false);
+    lv_anim_start(&a);
+}
+
+/* --- eye morphing ---------------------------------------------------------- */
+
+typedef struct {
+    int32_t lw, lh; /* left eye size */
+    int32_t rw, rh; /* right eye size */
+    int32_t gap;    /* distance of each eye centre from the face centre */
+    int32_t dy;
+    lv_color_t color;
+} eye_pose_t;
+
+#define MORPH_MS 340
+
+static eye_pose_t s_morph_from;
+static eye_pose_t s_morph_to; /* doubles as the morph animation's var */
+
+static void eyes_apply(const eye_pose_t *p)
+{
+    lv_obj_set_size(s_eye_l, p->lw, p->lh);
+    lv_obj_set_size(s_eye_r, p->rw, p->rh);
+    lv_obj_align(s_eye_l, LV_ALIGN_CENTER, -p->gap, p->dy);
+    lv_obj_align(s_eye_r, LV_ALIGN_CENTER, p->gap, p->dy);
+
+    /* Subtle vertical sheen: base color on top fading darker below. */
+    const lv_color_t shade = lv_color_darken(p->color, 70);
+    lv_obj_t *eyes[] = {s_eye_l, s_eye_r};
+    for (size_t i = 0; i < 2; i++) {
+        lv_obj_set_style_bg_color(eyes[i], p->color, 0);
+        lv_obj_set_style_bg_grad_color(eyes[i], shade, 0);
+        lv_obj_set_style_bg_grad_dir(eyes[i], LV_GRAD_DIR_VER, 0);
+    }
+}
+
+static int32_t morph_lerp(int32_t from, int32_t to, int32_t t)
+{
+    return from + ((to - from) * t) / 1024;
+}
+
+static void morph_exec(void *var, int32_t t)
+{
+    (void)var;
+    const int32_t tc = LV_CLAMP(0, t, 1024);
+    const eye_pose_t p = {
+        .lw = LV_MAX(morph_lerp(s_morph_from.lw, s_morph_to.lw, t), 1),
+        .lh = LV_MAX(morph_lerp(s_morph_from.lh, s_morph_to.lh, t), 1),
+        .rw = LV_MAX(morph_lerp(s_morph_from.rw, s_morph_to.rw, t), 1),
+        .rh = LV_MAX(morph_lerp(s_morph_from.rh, s_morph_to.rh, t), 1),
+        .gap = morph_lerp(s_morph_from.gap, s_morph_to.gap, t),
+        .dy = morph_lerp(s_morph_from.dy, s_morph_to.dy, t),
+        .color = lv_color_mix(s_morph_to.color, s_morph_from.color,
+                              (uint8_t)((tc * 255) / 1024)),
+    };
+    eyes_apply(&p);
+}
+
+static bool eyes_morphing(void)
+{
+    return lv_anim_get(&s_morph_to, morph_exec) != NULL;
+}
+
+/* Glide both eyes from wherever they are now (mid-blink, mid-surprise...)
+ * to the target pose with a slight springy overshoot. */
+static void morph_eyes_pose(const eye_pose_t *to)
+{
+    s_morph_from = (eye_pose_t){
+        .lw = lv_obj_get_style_width(s_eye_l, LV_PART_MAIN),
+        .lh = lv_obj_get_style_height(s_eye_l, LV_PART_MAIN),
+        .rw = lv_obj_get_style_width(s_eye_r, LV_PART_MAIN),
+        .rh = lv_obj_get_style_height(s_eye_r, LV_PART_MAIN),
+        .gap = lv_obj_get_style_x(s_eye_r, LV_PART_MAIN),
+        .dy = lv_obj_get_style_y(s_eye_l, LV_PART_MAIN),
+        .color = lv_obj_get_style_bg_color(s_eye_l, LV_PART_MAIN),
+    };
+    s_morph_to = *to;
+    s_eye_w = to->lw;
+    s_eye_h = to->lh;
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, &s_morph_to);
+    lv_anim_set_values(&a, 0, 1024);
+    lv_anim_set_duration(&a, MORPH_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_overshoot);
+    lv_anim_set_exec_cb(&a, morph_exec);
+    lv_anim_start(&a);
+}
+
+/* --- cross-fades (mouth shapes, symbols) ------------------------------------ */
+
+static void fade_hidden_cb(lv_anim_t *a)
+{
+    lv_obj_t *obj = lv_anim_get_user_data(a);
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_opa(obj, LV_OPA_COVER, 0);
+}
+
+static void fade_obj(lv_obj_t *obj, bool show)
+{
+    const bool hidden = lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    if (!show && hidden) {
+        return;
+    }
+    if (show && hidden) {
+        lv_obj_set_style_opa(obj, LV_OPA_TRANSP, 0);
+        face_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, obj);
+    lv_anim_set_values(&a, lv_obj_get_style_opa(obj, LV_PART_MAIN),
+                       show ? LV_OPA_COVER : LV_OPA_TRANSP);
+    lv_anim_set_duration(&a, show ? 240 : 160);
+    lv_anim_set_delay(&a, show ? 90 : 0);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&a, anim_set_opa);
+    if (!show) {
+        lv_anim_set_user_data(&a, obj);
+        lv_anim_set_completed_cb(&a, fade_hidden_cb);
+    }
+    lv_anim_start(&a);
+}
+
+/* Instant counterpart of fade_obj(): cancel any fade, fully opaque. */
+static void unfade_obj(lv_obj_t *obj)
+{
+    lv_anim_delete(obj, anim_set_opa);
+    lv_obj_set_style_opa(obj, LV_OPA_COVER, 0);
+}
+
 static void restore_standard_canvas(void)
 {
     lv_obj_set_style_bg_color(lv_screen_active(), lv_color_black(), 0);
@@ -134,8 +369,9 @@ static void restore_standard_canvas(void)
 
 static void blink_timer_cb(lv_timer_t *timer)
 {
-    (void)timer;
-    if (!s_blink_enabled) {
+    /* Natural rhythm: 2.2-5.4 s apart, and now and then a quick double blink. */
+    lv_timer_set_period(timer, 2200 + esp_random() % 3200);
+    if (!s_blink_enabled || eyes_morphing()) {
         return;
     }
     lv_anim_t a;
@@ -149,6 +385,45 @@ static void blink_timer_cb(lv_timer_t *timer)
     lv_anim_start(&a);
     lv_anim_set_var(&a, s_eye_r);
     lv_anim_start(&a);
+
+    if (esp_random() % 5 == 0) {
+        lv_anim_set_exec_cb(&a, anim_set_height_again);
+        lv_anim_set_delay(&a, 260);
+        lv_anim_set_early_apply(&a, false);
+        lv_anim_set_var(&a, s_eye_l);
+        lv_anim_start(&a);
+        lv_anim_set_var(&a, s_eye_r);
+        lv_anim_start(&a);
+    }
+}
+
+/* Idle glances: every few seconds the eyes dart to a random spot, rest there
+ * briefly and drift back, so a waiting face never looks frozen. */
+static void glance_timer_cb(lv_timer_t *timer)
+{
+    lv_timer_set_period(timer, 2600 + esp_random() % 3800);
+    if (!s_glance_enabled || eyes_morphing()) {
+        return;
+    }
+    const int32_t dx = (int32_t)(esp_random() % (uint32_t)(2 * FD(6) + 1)) - FD(6);
+    const int32_t dy = (int32_t)(esp_random() % (uint32_t)(2 * FD(3) + 1)) - FD(3);
+    const uint32_t hold_ms = 500 + esp_random() % 900;
+    lv_obj_t *eyes[] = {s_eye_l, s_eye_r};
+    for (size_t i = 0; i < 2; i++) {
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, eyes[i]);
+        lv_anim_set_duration(&a, 130);
+        lv_anim_set_playback_delay(&a, hold_ms);
+        lv_anim_set_playback_duration(&a, 260);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_set_values(&a, 0, dx);
+        lv_anim_set_exec_cb(&a, anim_translate_x);
+        lv_anim_start(&a);
+        lv_anim_set_values(&a, 0, dy);
+        lv_anim_set_exec_cb(&a, anim_translate_y);
+        lv_anim_start(&a);
+    }
 }
 
 static void think_timer_cb(lv_timer_t *timer)
@@ -162,6 +437,8 @@ static void think_timer_cb(lv_timer_t *timer)
 static void stop_dynamics(void)
 {
     s_blink_enabled = false;
+    s_glance_enabled = false;
+    s_expression_active = false;
     if (s_think_timer != NULL) {
         lv_timer_delete(s_think_timer);
         s_think_timer = NULL;
@@ -174,21 +451,30 @@ static void stop_dynamics(void)
         lv_timer_delete(s_surprise_end_timer);
         s_surprise_end_timer = NULL;
     }
-    lv_anim_delete(s_eye_l, NULL);
-    lv_anim_delete(s_eye_r, NULL);
-    lv_anim_delete(s_open, NULL);
-    lv_anim_delete(s_face, NULL);
-    lv_obj_set_style_translate_x(s_eye_l, 0, 0);
-    lv_obj_set_style_translate_x(s_eye_r, 0, 0);
-    lv_obj_set_style_translate_y(s_eye_l, 0, 0);
-    lv_obj_set_style_translate_y(s_eye_r, 0, 0);
-    lv_obj_set_style_translate_x(s_face, 0, 0);
-    lv_obj_set_style_translate_y(s_face, 0, 0);
-    lv_obj_set_style_translate_y(s_open, 0, 0);
+    lv_anim_delete(&s_morph_to, NULL);
+    lv_obj_t *animated[] = {s_eye_l, s_eye_r, s_open, s_face,
+                            s_smile, s_frown, s_flat, s_status};
+    for (size_t i = 0; i < sizeof(animated) / sizeof(animated[0]); i++) {
+        lv_anim_delete(animated[i], NULL);
+        lv_obj_set_style_translate_x(animated[i], 0, 0);
+        lv_obj_set_style_translate_y(animated[i], 0, 0);
+    }
+    s_wave_count = 0; /* every wave lived on one of the objects above */
+    lv_obj_set_style_opa(s_status, LV_OPA_COVER, 0);
+    lv_obj_align(s_status, LV_ALIGN_CENTER, 0, FD(34));
+    if (s_tear != NULL) {
+        lv_anim_delete(s_tear, NULL);
+        lv_obj_add_flag(s_tear, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_translate_y(s_tear, 0, 0);
+        lv_obj_set_style_opa(s_tear, LV_OPA_COVER, 0);
+    }
     for (size_t i = 0; i < 3; i++) {
         if (s_star[i] != NULL) {
             lv_anim_delete(s_star[i], NULL);
             lv_obj_add_flag(s_star[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_translate_x(s_star[i], 0, 0);
+            lv_obj_set_style_translate_y(s_star[i], 0, 0);
+            lv_obj_set_style_opa(s_star[i], LV_OPA_COVER, 0);
         }
         if (s_alert_bar[i] != NULL) {
             lv_anim_delete(s_alert_bar[i], NULL);
@@ -197,30 +483,31 @@ static void stop_dynamics(void)
     restore_standard_canvas();
 }
 
+/* Instant eye pose (surprise and dizzy choreograph their own eyes). */
 static void set_eyes(int32_t w, int32_t h, int32_t dy, lv_color_t color)
 {
+    lv_anim_delete(&s_morph_to, NULL);
     s_eye_w = w;
     s_eye_h = h;
-    lv_obj_set_size(s_eye_l, w, h);
-    lv_obj_set_size(s_eye_r, w, h);
-    lv_obj_align(s_eye_l, LV_ALIGN_CENTER, -FD(22), dy);
-    lv_obj_align(s_eye_r, LV_ALIGN_CENTER, FD(22), dy);
-
-    /* Subtle vertical sheen: base color on top fading darker below. */
-    const lv_color_t shade = lv_color_darken(color, 70);
-    lv_obj_t *eyes[] = {s_eye_l, s_eye_r};
-    for (size_t i = 0; i < 2; i++) {
-        lv_obj_set_style_bg_color(eyes[i], color, 0);
-        lv_obj_set_style_bg_grad_color(eyes[i], shade, 0);
-        lv_obj_set_style_bg_grad_dir(eyes[i], LV_GRAD_DIR_VER, 0);
-    }
+    const eye_pose_t pose = {w, h, w, h, FD(22), dy, color};
+    eyes_apply(&pose);
 }
 
-static void set_mouth(mouth_mode_t mode, lv_color_t color, int32_t weight)
+static void morph_eyes_asym(int32_t lw, int32_t lh, int32_t rw, int32_t rh,
+                            int32_t dy, lv_color_t color)
 {
-    lv_obj_add_flag(s_smile, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_flat, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_open, LV_OBJ_FLAG_HIDDEN);
+    const eye_pose_t pose = {lw, lh, rw, rh, FD(22), dy, color};
+    morph_eyes_pose(&pose);
+}
+
+static void morph_eyes(int32_t w, int32_t h, int32_t dy, lv_color_t color)
+{
+    morph_eyes_asym(w, h, w, h, dy, color);
+}
+
+/* Shapes the widget used by `mode` and returns it (NULL for MOUTH_NONE). */
+static lv_obj_t *mouth_configure(mouth_mode_t mode, lv_color_t color, int32_t weight)
+{
     lv_obj_add_flag(s_surprise_inner, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_style_border_width(s_open, 0, 0);
     lv_obj_set_style_bg_opa(s_open, LV_OPA_COVER, 0);
@@ -232,32 +519,27 @@ static void set_mouth(mouth_mode_t mode, lv_color_t color, int32_t weight)
         lv_obj_align(s_smile, LV_ALIGN_CENTER, 0, FD(6));
         lv_obj_set_style_arc_color(s_smile, color, LV_PART_MAIN);
         lv_obj_set_style_arc_width(s_smile, weight, LV_PART_MAIN);
-        face_clear_flag(s_smile, LV_OBJ_FLAG_HIDDEN);
-        break;
+        return s_smile;
     case MOUTH_SAD:
-        lv_arc_set_bg_angles(s_smile, 205, 335);
-        lv_obj_align(s_smile, LV_ALIGN_CENTER, 0, FD(30));
-        lv_obj_set_style_arc_color(s_smile, color, LV_PART_MAIN);
-        lv_obj_set_style_arc_width(s_smile, weight, LV_PART_MAIN);
-        face_clear_flag(s_smile, LV_OBJ_FLAG_HIDDEN);
-        break;
+        lv_arc_set_bg_angles(s_frown, 205, 335);
+        lv_obj_align(s_frown, LV_ALIGN_CENTER, 0, FD(30));
+        lv_obj_set_style_arc_color(s_frown, color, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(s_frown, weight, LV_PART_MAIN);
+        return s_frown;
     case MOUTH_FLAT:
         lv_obj_set_size(s_flat, FD(24), weight);
         lv_obj_align(s_flat, LV_ALIGN_CENTER, 0, FD(20));
         lv_obj_set_style_bg_color(s_flat, color, 0);
-        face_clear_flag(s_flat, LV_OBJ_FLAG_HIDDEN);
-        break;
+        return s_flat;
     case MOUTH_O:
         lv_obj_set_size(s_open, FD(9), FD(9));
         lv_obj_align(s_open, LV_ALIGN_CENTER, 0, FD(20));
         lv_obj_set_style_bg_color(s_open, color, 0);
-        face_clear_flag(s_open, LV_OBJ_FLAG_HIDDEN);
-        break;
+        return s_open;
     case MOUTH_OPEN: {
         lv_obj_set_size(s_open, FD(16), FD(6));
         lv_obj_align(s_open, LV_ALIGN_CENTER, 0, FD(20));
         lv_obj_set_style_bg_color(s_open, color, 0);
-        face_clear_flag(s_open, LV_OBJ_FLAG_HIDDEN);
         lv_anim_t a;
         lv_anim_init(&a);
         lv_anim_set_var(&a, s_open);
@@ -268,11 +550,35 @@ static void set_mouth(mouth_mode_t mode, lv_color_t color, int32_t weight)
         lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
         lv_anim_set_exec_cb(&a, anim_set_height);
         lv_anim_start(&a);
-        break;
+        return s_open;
     }
     case MOUTH_NONE:
     default:
-        break;
+        return NULL;
+    }
+}
+
+/* Instant mouth change (surprise and dizzy lay out their own mouths). */
+static void set_mouth(mouth_mode_t mode, lv_color_t color, int32_t weight)
+{
+    lv_obj_t *mouths[] = {s_smile, s_frown, s_flat, s_open};
+    for (size_t i = 0; i < 4; i++) {
+        unfade_obj(mouths[i]);
+        lv_obj_add_flag(mouths[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_t *target = mouth_configure(mode, color, weight);
+    if (target != NULL) {
+        face_clear_flag(target, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Cross-fade from whatever mouth is showing to the new shape. */
+static void morph_mouth(mouth_mode_t mode, lv_color_t color, int32_t weight)
+{
+    lv_obj_t *target = mouth_configure(mode, color, weight);
+    lv_obj_t *mouths[] = {s_smile, s_frown, s_flat, s_open};
+    for (size_t i = 0; i < 4; i++) {
+        fade_obj(mouths[i], mouths[i] == target);
     }
 }
 
@@ -481,24 +787,253 @@ static void surprise_begin(app_state_t return_state)
 static void expr_neutral(void)
 {
     /* Tall capsule eyes (height ~2x width) read as friendly and alert. */
-    set_eyes(FD(12), FD(24), -FD(10), col_eye());
-    set_mouth(MOUTH_SMILE, col_eye(), FD(3));
+    morph_eyes(FD(12), FD(24), -FD(10), col_eye());
+    morph_mouth(MOUTH_SMILE, col_eye(), FD(3));
     set_texts(NULL, NULL);
 }
 
 static void expr_happy(void)
 {
     /* squinted, wide "laughing" eyes + bold smile */
-    set_eyes(FD(17), FD(9), -FD(10), col_eye());
-    set_mouth(MOUTH_SMILE, col_warm(), FD(5));
+    morph_eyes(FD(17), FD(9), -FD(10), col_eye());
+    morph_mouth(MOUTH_SMILE, col_warm(), FD(5));
     set_texts(NULL, NULL);
 }
 
 static void expr_sad(const char *symbol, const char *caption)
 {
-    set_eyes(FD(13), FD(12), -FD(8), col_eye());
-    set_mouth(MOUTH_SAD, col_alert(), FD(3));
+    morph_eyes(FD(13), FD(12), -FD(8), col_eye());
+    morph_mouth(MOUTH_SAD, col_alert(), FD(3));
     set_texts(symbol, caption);
+}
+
+/* --- living expressions -----------------------------------------------------
+ * Every look morphs in from the current face (eyes glide, mouth cross-fades)
+ * and then keeps moving until the next state or face call reaches
+ * stop_dynamics(). Motion that touches a property the morph also writes
+ * (eye height, arc angles) waits MORPH_MS before it starts. */
+
+static void look_happy(int32_t weight)
+{
+    /* Cheerful bounce: eyes hop, the smile follows a beat later and grins. */
+    morph_eyes(FD(16), FD(10), -FD(10), col_eye());
+    morph_mouth(MOUTH_SMILE, col_warm(), weight);
+    set_texts(NULL, NULL);
+    start_wave(s_eye_l, WAVE_TRANSLATE_Y, 0, -FD(3), 620, 0);
+    start_wave(s_eye_r, WAVE_TRANSLATE_Y, 0, -FD(3), 620, 0);
+    start_wave(s_smile, WAVE_TRANSLATE_Y, 0, -FD(2), 620, 90);
+    start_wave(s_smile, WAVE_SMILE_SPREAD, 0, 10, 1240, MORPH_MS);
+    s_blink_enabled = true;
+    s_expression_active = true;
+}
+
+static void look_sad(void)
+{
+    /* Slow sigh: eyes and mouth sink and recover while a tear keeps falling
+     * from below the left eye. */
+    morph_eyes(FD(13), FD(12), -FD(8), col_eye());
+    morph_mouth(MOUTH_SAD, col_alert(), FD(3));
+    set_texts(NULL, NULL);
+    start_wave(s_eye_l, WAVE_TRANSLATE_Y, 0, FD(3), 2600, 0);
+    start_wave(s_eye_r, WAVE_TRANSLATE_Y, 0, FD(3), 2600, 0);
+    start_wave(s_frown, WAVE_TRANSLATE_Y, 0, FD(2), 2600, 150);
+
+    lv_obj_align(s_tear, LV_ALIGN_CENTER, -FD(25), FD(2));
+    face_clear_flag(s_tear, LV_OBJ_FLAG_HIDDEN);
+    start_repeat(s_tear, anim_translate_y, 0, FD(16), 1100, MORPH_MS, 500,
+                 lv_anim_path_ease_in);
+    start_repeat(s_tear, anim_set_opa, LV_OPA_COVER, LV_OPA_TRANSP, 1100,
+                 MORPH_MS, 500, lv_anim_path_ease_in);
+    s_blink_enabled = true;
+    s_expression_active = true;
+}
+
+static void look_confused(void)
+{
+    /* Puzzled look-around: mismatched eyes glance side to side, the mouth
+     * shifts the other way and the question mark bobs. Blink stays off
+     * because it would reset the deliberately mismatched eye sizes. */
+    morph_eyes_asym(FD(14), FD(18), FD(11), FD(11), -FD(10), col_eye());
+    morph_mouth(MOUTH_FLAT, col_eye(), FD(2));
+    set_texts("?", NULL);
+    start_wave(s_eye_l, WAVE_TRANSLATE_X, 0, FD(5), 2400, 0);
+    start_wave(s_eye_r, WAVE_TRANSLATE_X, 0, FD(5), 2400, 0);
+    start_wave(s_flat, WAVE_TRANSLATE_X, 0, -FD(3), 2400, 0);
+    start_wave(s_status, WAVE_TRANSLATE_Y, 0, -FD(3), 800, 0);
+    s_expression_active = true;
+}
+
+static void look_comfort(int32_t weight)
+{
+    /* Calm breathing: the face drifts gently, the smile swells softly and
+     * warm sparks float upward on both sides. */
+    static const int32_t spark_x_pct[3] = {-33, 33, -27};
+    static const int32_t spark_y_pct[3] = {12, 6, -4};
+
+    morph_eyes(FD(15), FD(8), -FD(9), col_warm());
+    morph_mouth(MOUTH_SMILE, col_warm(), weight);
+    set_texts(NULL, NULL);
+    start_wave(s_eye_l, WAVE_TRANSLATE_Y, 0, FD(2), 3000, 0);
+    start_wave(s_eye_r, WAVE_TRANSLATE_Y, 0, FD(2), 3000, 0);
+    start_wave(s_smile, WAVE_TRANSLATE_Y, 0, FD(2), 3000, 120);
+    start_wave(s_smile, WAVE_ARC_WIDTH, weight, FD(1), 3000, MORPH_MS);
+
+    for (size_t i = 0; i < 3; i++) {
+        if (s_star[i] == NULL) {
+            continue;
+        }
+        lv_obj_align(s_star[i], LV_ALIGN_CENTER, FD(spark_x_pct[i]), FD(spark_y_pct[i]));
+        face_clear_flag(s_star[i], LV_OBJ_FLAG_HIDDEN);
+        start_repeat(s_star[i], anim_translate_y, 0, -FD(14), 1800,
+                     (uint32_t)i * 600, 200, lv_anim_path_ease_out);
+        start_repeat(s_star[i], anim_set_opa, LV_OPA_COVER, LV_OPA_TRANSP, 1800,
+                     (uint32_t)i * 600, 200, lv_anim_path_ease_in);
+    }
+    s_blink_enabled = true;
+    s_expression_active = true;
+}
+
+static void look_sleepy(void)
+{
+    /* Drowsy: heavy lids slowly droop and lift, a "z" drifts up and fades. */
+    morph_eyes(FD(15), FD(4), -FD(6), lv_color_darken(col_eye(), 40));
+    morph_mouth(MOUTH_O, col_eye(), 0);
+    start_wave(s_eye_l, WAVE_HEIGHT, FD(4), FD(2), 2800, MORPH_MS);
+    start_wave(s_eye_r, WAVE_HEIGHT, FD(4), FD(2), 2800, MORPH_MS);
+
+    set_texts("z", NULL);
+    lv_obj_align(s_status, LV_ALIGN_CENTER, FD(22), -FD(24));
+    start_repeat(s_status, anim_translate_y, 0, -FD(12), 1600, MORPH_MS, 400,
+                 lv_anim_path_ease_out);
+    start_repeat(s_status, anim_translate_x, 0, FD(6), 1600, MORPH_MS, 400,
+                 lv_anim_path_ease_in_out);
+    start_repeat(s_status, anim_set_opa, LV_OPA_COVER, LV_OPA_TRANSP, 1600,
+                 MORPH_MS, 400, lv_anim_path_ease_in);
+    s_expression_active = true;
+}
+
+static void look_wink(int32_t weight)
+{
+    /* Playful wink: the right eye snaps shut and pops open about every two
+     * seconds while the smile grins and the open eye bobs. */
+    morph_eyes(FD(13), FD(20), -FD(10), col_eye());
+    morph_mouth(MOUTH_SMILE, col_warm(), weight);
+    set_texts(NULL, NULL);
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_eye_r);
+    lv_anim_set_values(&a, FD(20), FD(2));
+    lv_anim_set_duration(&a, 110);
+    lv_anim_set_playback_delay(&a, 280);
+    lv_anim_set_playback_duration(&a, 170);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_repeat_delay(&a, 1500);
+    lv_anim_set_delay(&a, MORPH_MS + 200);
+    lv_anim_set_early_apply(&a, false);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+    lv_anim_set_exec_cb(&a, anim_set_height);
+    lv_anim_start(&a);
+
+    start_wave(s_smile, WAVE_SMILE_SPREAD, 0, 8, 1030, MORPH_MS);
+    start_wave(s_eye_l, WAVE_TRANSLATE_Y, 0, -FD(1), 1030, 0);
+    s_expression_active = true;
+}
+
+/* Shared by host face commands and the expression show. */
+static esp_err_t face_apply(const char *emotion, int32_t weight)
+{
+    stop_dynamics();
+    if (strcmp(emotion, "smile") == 0 || strcmp(emotion, "happy") == 0) {
+        look_happy(weight);
+    } else if (strcmp(emotion, "sad") == 0) {
+        look_sad();
+    } else if (strcmp(emotion, "surprised") == 0) {
+        surprise_begin(s_current_state);
+    } else if (strcmp(emotion, "confused") == 0) {
+        look_confused();
+    } else if (strcmp(emotion, "comfort") == 0 || strcmp(emotion, "gentle") == 0) {
+        look_comfort(weight);
+    } else if (strcmp(emotion, "sleepy") == 0) {
+        look_sleepy();
+    } else if (strcmp(emotion, "wink") == 0) {
+        look_wink(weight);
+    } else {
+        /* unknown emotion string: neutral face, report unsupported so the
+         * facade also logs it for diagnosis. */
+        expr_neutral();
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    return ESP_OK;
+}
+
+/* --- expression show ----------------------------------------------------------
+ * Cycles through every look on its own. Started by the face command "demo"
+ * or at boot with CONFIG_ELDER_UI_EXPRESSION_DEMO_AT_BOOT. Host state
+ * changes pause it and IDLE resumes it; any other host face, user or error
+ * command ends it so the host keeps full control. */
+
+typedef struct {
+    const char *face; /* NULL: show `state` instead */
+    app_state_t state;
+    uint32_t hold_ms;
+} demo_step_t;
+
+static const demo_step_t s_demo_steps[] = {
+    {NULL, APP_STATE_IDLE, 4200},
+    {"happy", APP_STATE_IDLE, 4200},
+    {"surprised", APP_STATE_IDLE, 2600},
+    {"sad", APP_STATE_IDLE, 4800},
+    {"confused", APP_STATE_IDLE, 4200},
+    {"comfort", APP_STATE_IDLE, 4800},
+    {"wink", APP_STATE_IDLE, 3600},
+    {"sleepy", APP_STATE_IDLE, 4800},
+    {NULL, APP_STATE_LISTENING, 3000},
+    {NULL, APP_STATE_THINKING, 3200},
+    {NULL, APP_STATE_SPEAKING, 3600},
+};
+
+static bool s_demo_enabled;
+static size_t s_demo_index;
+static lv_timer_t *s_demo_timer;
+static app_state_t s_host_state = APP_STATE_IDLE;
+
+static void demo_timer_cb(lv_timer_t *timer)
+{
+    const demo_step_t *step = &s_demo_steps[s_demo_index];
+    s_demo_index = (s_demo_index + 1) % (sizeof(s_demo_steps) / sizeof(s_demo_steps[0]));
+    if (step->face != NULL) {
+        (void)face_apply(step->face, FD(4));
+    } else {
+        apply_state(step->state);
+    }
+    lv_timer_set_period(timer, step->hold_ms);
+}
+
+static void demo_pause(void)
+{
+    if (s_demo_timer != NULL) {
+        lv_timer_delete(s_demo_timer);
+        s_demo_timer = NULL;
+    }
+}
+
+static void demo_resume(uint32_t delay_ms)
+{
+    if (!s_demo_enabled) {
+        return;
+    }
+    demo_pause();
+    s_demo_timer = lv_timer_create(demo_timer_cb, delay_ms, NULL);
+}
+
+static void demo_end(void)
+{
+    if (s_demo_enabled) {
+        s_demo_enabled = false;
+        demo_pause();
+        s_current_state = s_host_state;
+    }
 }
 
 static void apply_state(app_state_t state)
@@ -515,17 +1050,20 @@ static void apply_state(app_state_t state)
 
     switch (state) {
     case APP_STATE_BOOTING:
-        set_eyes(FD(14), FD(2), -FD(10), col_eye());
-        set_mouth(MOUTH_NONE, col_eye(), 0);
+        morph_eyes(FD(14), FD(2), -FD(10), col_eye());
+        morph_mouth(MOUTH_NONE, col_eye(), 0);
         set_texts(NULL, NULL);
         break;
     case APP_STATE_IDLE:
         expr_neutral();
         s_blink_enabled = true;
+#if !CONFIG_ELDER_UI_MOTION
+        s_glance_enabled = true; /* idle glances stand in for IMU gaze */
+#endif
         break;
     case APP_STATE_FACE_SCANNING: {
-        set_eyes(FD(13), FD(16), -FD(10), col_accent());
-        set_mouth(MOUTH_FLAT, col_eye(), FD(2));
+        morph_eyes(FD(13), FD(16), -FD(10), col_accent());
+        morph_mouth(MOUTH_FLAT, col_eye(), FD(2));
         set_texts(NULL, NULL);
         lv_anim_t a;
         lv_anim_init(&a);
@@ -548,41 +1086,40 @@ static void apply_state(app_state_t state)
         expr_neutral();
         break;
     case APP_STATE_LISTENING:
-        set_eyes(FD(14), FD(28), -FD(10), col_accent());
-        set_mouth(MOUTH_O, col_eye(), 0);
+        morph_eyes(FD(14), FD(28), -FD(10), col_accent());
+        morph_mouth(MOUTH_O, col_eye(), 0);
         set_texts(NULL, NULL);
         break;
     case APP_STATE_THINKING:
-        set_eyes(FD(11), FD(18), -FD(14), col_eye());
-        set_mouth(MOUTH_FLAT, col_eye(), FD(2));
+        morph_eyes(FD(11), FD(18), -FD(14), col_eye());
+        morph_mouth(MOUTH_FLAT, col_eye(), FD(2));
         set_texts(".", NULL);
         s_think_phase = 0;
         s_think_timer = lv_timer_create(think_timer_cb, 400, NULL);
         break;
     case APP_STATE_SPEAKING:
-        set_eyes(FD(14), FD(16), -FD(10), col_eye());
-        set_mouth(MOUTH_OPEN, col_warm(), 0);
+        morph_eyes(FD(14), FD(16), -FD(10), col_eye());
+        morph_mouth(MOUTH_OPEN, col_warm(), 0);
         set_texts(NULL, NULL);
         break;
     case APP_STATE_CONFUSED:
-        set_eyes(FD(12), FD(22), -FD(10), col_eye());
-        lv_obj_set_size(s_eye_r, FD(11), FD(11)); /* asymmetric eyes */
-        set_mouth(MOUTH_FLAT, col_eye(), FD(2));
+        morph_eyes_asym(FD(12), FD(22), FD(11), FD(11), -FD(10), col_eye());
+        morph_mouth(MOUTH_FLAT, col_eye(), FD(2));
         set_texts("?", NULL);
         break;
     case APP_STATE_COMFORT:
-        set_eyes(FD(15), FD(8), -FD(9), col_warm());
-        set_mouth(MOUTH_SMILE, col_warm(), FD(4));
+        morph_eyes(FD(15), FD(8), -FD(9), col_warm());
+        morph_mouth(MOUTH_SMILE, col_warm(), FD(4));
         set_texts(NULL, NULL);
         break;
     case APP_STATE_PRIVACY_MIC_OFF:
-        set_eyes(FD(13), FD(13), -FD(12), col_eye());
-        set_mouth(MOUTH_FLAT, col_eye(), FD(2));
+        morph_eyes(FD(13), FD(13), -FD(12), col_eye());
+        morph_mouth(MOUTH_FLAT, col_eye(), FD(2));
         set_texts(LV_SYMBOL_MUTE, NULL);
         break;
     case APP_STATE_PRIVACY_CAMERA_OFF:
-        set_eyes(FD(13), FD(13), -FD(12), col_eye());
-        set_mouth(MOUTH_FLAT, col_eye(), FD(2));
+        morph_eyes(FD(13), FD(13), -FD(12), col_eye());
+        morph_mouth(MOUTH_FLAT, col_eye(), FD(2));
         set_texts(LV_SYMBOL_EYE_CLOSE, NULL);
         break;
     case APP_STATE_NETWORK_ERROR:
@@ -592,8 +1129,8 @@ static void apply_state(app_state_t state)
         expr_sad(LV_SYMBOL_WARNING, NULL);
         break;
     case APP_STATE_LOW_POWER:
-        set_eyes(FD(14), FD(3), -FD(10), col_eye());
-        set_mouth(MOUTH_FLAT, col_eye(), FD(2));
+        morph_eyes(FD(14), FD(3), -FD(10), col_eye());
+        morph_mouth(MOUTH_FLAT, col_eye(), FD(2));
         set_texts(NULL, NULL);
         break;
     default:
@@ -741,7 +1278,7 @@ static void motion_timer_cb(lv_timer_t *timer)
         }
     }
 
-    if (s_dizzy_active || !motion_allowed()) {
+    if (s_dizzy_active || s_expression_active || s_glance_enabled || !motion_allowed()) {
         return;
     }
 
@@ -830,6 +1367,15 @@ static void build_face(void)
     lv_obj_set_style_arc_rounded(s_smile, true, LV_PART_MAIN);
     face_clear_flag(s_smile, LV_OBJ_FLAG_CLICKABLE);
 
+    s_frown = lv_arc_create(s_face);
+    lv_obj_set_size(s_frown, FD(36), FD(36));
+    lv_obj_set_style_arc_opa(s_frown, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(s_frown, LV_OPA_TRANSP, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(s_frown, 0, LV_PART_KNOB);
+    lv_obj_set_style_arc_rounded(s_frown, true, LV_PART_MAIN);
+    face_clear_flag(s_frown, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_frown, LV_OBJ_FLAG_HIDDEN);
+
     s_flat = lv_obj_create(s_face);
     lv_obj_set_style_radius(s_flat, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_border_width(s_flat, 0, 0);
@@ -897,7 +1443,17 @@ static void build_face(void)
     lv_obj_set_style_text_align(s_caption, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_caption, LV_ALIGN_CENTER, 0, FD(34));
 
+    /* Tear drop of the animated sad face, hidden otherwise. */
+    s_tear = lv_obj_create(s_face);
+    lv_obj_set_size(s_tear, FD(3), FD(5));
+    lv_obj_set_style_radius(s_tear, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(s_tear, 0, 0);
+    lv_obj_set_style_bg_color(s_tear, col_accent(), 0);
+    face_clear_flag(s_tear, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_tear, LV_OBJ_FLAG_HIDDEN);
+
     s_blink_timer = lv_timer_create(blink_timer_cb, 3500, NULL);
+    s_glance_timer = lv_timer_create(glance_timer_cb, 3000, NULL);
     s_motion_timer = lv_timer_create(motion_timer_cb, 40, NULL);
 
     apply_state(APP_STATE_BOOTING);
@@ -918,6 +1474,10 @@ esp_err_t ui_board_init(void)
         return ESP_ERR_TIMEOUT;
     }
     build_face();
+#if CONFIG_ELDER_UI_EXPRESSION_DEMO_AT_BOOT
+    s_demo_enabled = true;
+    demo_resume(4000);
+#endif
     bsp_display_unlock();
 
     ESP_LOGI(TAG, "AMOLED 1.43C round face UI ready, canvas d=%d px", (int)s_d);
@@ -928,6 +1488,12 @@ esp_err_t ui_board_show_state(app_state_t state)
 {
     if (!bsp_display_lock(1000)) {
         return ESP_ERR_TIMEOUT;
+    }
+    s_host_state = state;
+    if (state == APP_STATE_IDLE) {
+        demo_resume(1500);
+    } else {
+        demo_pause();
     }
     apply_state(state);
     bsp_display_unlock();
@@ -960,33 +1526,17 @@ esp_err_t ui_board_show_face(const char *emotion, float intensity)
     if (!bsp_display_lock(1000)) {
         return ESP_ERR_TIMEOUT;
     }
-    stop_dynamics();
-    if (strcmp(emotion, "smile") == 0 || strcmp(emotion, "happy") == 0) {
-        set_eyes(FD(16), FD(10), -FD(10), col_eye());
-        set_mouth(MOUTH_SMILE, col_warm(), weight);
-        set_texts(NULL, NULL);
-    } else if (strcmp(emotion, "sad") == 0) {
-        expr_sad(NULL, NULL);
-    } else if (strcmp(emotion, "surprised") == 0) {
-        surprise_begin(s_current_state);
-    } else if (strcmp(emotion, "confused") == 0) {
-        set_eyes(FD(14), FD(18), -FD(10), col_eye());
-        lv_obj_set_size(s_eye_r, FD(11), FD(11));
-        set_mouth(MOUTH_FLAT, col_eye(), FD(2));
-        set_texts("?", NULL);
-    } else if (strcmp(emotion, "comfort") == 0 || strcmp(emotion, "gentle") == 0) {
-        set_eyes(FD(15), FD(8), -FD(9), col_warm());
-        set_mouth(MOUTH_SMILE, col_warm(), weight);
-        set_texts(NULL, NULL);
+    esp_err_t result = ESP_OK;
+    if (strcmp(emotion, "demo") == 0) {
+        s_demo_enabled = true;
+        s_demo_index = 0;
+        demo_resume(10);
     } else {
-        /* unknown emotion string: neutral face, report unsupported so the
-         * facade also logs it for diagnosis. */
-        expr_neutral();
-        bsp_display_unlock();
-        return ESP_ERR_NOT_SUPPORTED;
+        demo_end();
+        result = face_apply(emotion, weight);
     }
     bsp_display_unlock();
-    return ESP_OK;
+    return result;
 }
 
 esp_err_t ui_board_show_user(bool recognized, const char *display_name)
@@ -997,6 +1547,7 @@ esp_err_t ui_board_show_user(bool recognized, const char *display_name)
     if (!bsp_display_lock(1000)) {
         return ESP_ERR_TIMEOUT;
     }
+    demo_end();
     stop_dynamics();
     if (recognized) {
         expr_happy();
@@ -1021,6 +1572,7 @@ esp_err_t ui_board_show_error(const char *code, const char *message)
     if (!bsp_display_lock(1000)) {
         return ESP_ERR_TIMEOUT;
     }
+    demo_end();
     stop_dynamics();
     expr_sad(symbol, message);
     lv_obj_align(s_status, LV_ALIGN_CENTER, 0, FD(34));

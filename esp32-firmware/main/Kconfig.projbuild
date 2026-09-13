@@ -113,6 +113,17 @@ menu "Elder companion firmware"
             Reserved for boards with a QMI8658 IMU. The 1.43C round display
             does not expose that sensor, so motion reactions stay disabled.
 
+    config ELDER_UI_EXPRESSION_DEMO_AT_BOOT
+        bool "Start the expression show at boot"
+        default n
+        depends on ELDER_UI_BOARD_AMOLED143C
+        help
+            Cycle through every animated expression on its own after boot,
+            for demos without a Raspberry Pi. Host state changes pause the
+            show and IDLE resumes it; any host face, user or error command
+            ends it. It can also be started at runtime with the JSON line
+            {"type":"face","emotion":"demo"}.
+
     menu "On-board audio verification"
         config ELDER_AUDIO_LOOPBACK_TEST
             bool "Record and replay through the built-in microphones and speaker"
