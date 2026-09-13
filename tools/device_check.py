@@ -207,7 +207,7 @@ def play_sound(dev: Device, name: str, timeout: float) -> None:
         print(f"已发送 sound={name}（固件目前只实现 speaker_test）。")
         time.sleep(1.0)
         return
-    print("已请求喇叭测试音（约 14 秒；若开机录音自检未结束，会排在它之后）…")
+    print("已请求喇叭测试音（若开机录音自检未结束，会排在它之后）…")
     first = len(dev.audio_stages)
     finished = wait_until(
         dev, lambda: any(s in SPEAKER_TEST_END_STAGES for s, _ in dev.audio_stages[first:]), timeout)

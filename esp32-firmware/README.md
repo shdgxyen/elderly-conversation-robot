@@ -167,9 +167,10 @@ This loopback proves only the local microphone/codec/amplifier/speaker path; it
 does not yet prove network speech recognition, Kimi, or speech synthesis.
 
 To check the speaker on its own, send `{"type":"sound","name":"speaker_test"}`
-or run `tools/device_check.py --sound speaker_test`. The firmware plays a 13.6 s
+or run `tools/device_check.py --sound speaker_test`. The firmware plays a 13.1 s
 clip embedded from `main/audio/speaker_test.pcm` (16 kHz mono PCM16): a Chinese
-voice prompt for intelligibility, an ascending chime, a 150 Hz-6 kHz sweep that
+voice prompt tuned for the small speaker (300 Hz high-pass, presence boost,
+compression, 6 dB headroom) to judge intelligibility, an ascending chime, a 150 Hz-6 kHz sweep that
 exposes rattle or distortion, and a closing prompt. It runs after any
 record/replay cycle in progress and shows the speaking expression. Regenerate
 the clip on macOS with `python3 tools/make_speaker_test_clip.py`.
